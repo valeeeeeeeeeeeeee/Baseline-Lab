@@ -30,11 +30,18 @@ jobs:
       - name: Run tests
         run: python -m pytest -q
 
+      # The excluded modules are not used by the app and only make the exe bigger. Do not add
+      # _pyrepl (scipy imports pydoc, which needs it) or mpl_toolkits (matplotlib warns without it).
       - name: Build executable
         run: >
           pyinstaller --noconsole --onefile --name "Baseline Lab"
           --icon src/baseline_lab/icon.ico
           --add-data "src/baseline_lab/icon.ico;baseline_lab"
+          --exclude-module PIL._avif --exclude-module PIL._webp
+          --exclude-module ssl --exclude-module _ssl --exclude-module _hashlib
+          --exclude-module pygments --exclude-module setuptools --exclude-module pkg_resources
+          --exclude-module pytest --exclude-module _pytest --exclude-module jinja2
+          --exclude-module pydoc_data --exclude-module yaml --exclude-module IPython
           src/main.py
 
       - name: Smoke test (the exe must start and stay open)
