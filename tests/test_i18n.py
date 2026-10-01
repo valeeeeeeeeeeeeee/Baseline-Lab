@@ -9,7 +9,7 @@ from baseline_lab import baselines as bl
 from baseline_lab import i18n
 from baseline_lab.gui import PEAK_PARAMS
 
-PKG = Path(__file__).parent.parent / "baseline_lab"
+PKG = Path(__file__).parent.parent / "src" / "baseline_lab"
 
 
 @pytest.fixture(autouse=True)
