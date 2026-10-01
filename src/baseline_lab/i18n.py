@@ -78,7 +78,7 @@ STRINGS: dict[str, tuple[str, str]] = {
     "adv_open": ("⚙  Opções avançadas ◂", "⚙  Advanced options ◂"),
     "language": ("Idioma:", "Language:"),
     "files": ("Arquivos", "Files"),
-    "remove": ("Remover da lista", "Remove from list"),
+    "remove": ("Remover", "Remove"),
     "result": ("Resultado", "Results"),
     "col_start": ("Início", "Start"),
     "col_peak": ("Pico", "Peak"),
@@ -134,11 +134,17 @@ STRINGS: dict[str, tuple[str, str]] = {
     "help_peaks": ("Sinal perto de 0 é ruído do ambiente: a baseline ali vira 0 e só os picos "
                    "contam. Cada pico fica com uma âncora em cada pé e vai até o sinal voltar ao "
                    "ruído; fora dos picos o corrigido é 0. Arraste as âncoras dos pés no "
-                   "gráfico para ajustar onde cada pico começa e termina.",
+                   "gráfico para ajustar onde cada pico começa e termina. Clique na curva: "
+                   "dentro de um pico, divide-o em dois; fora, cria um pico novo. Clique direito "
+                   "numa âncora: remove o pico (ou junta dois picos, se for a âncora que os "
+                   "divide).",
                    "Signal near 0 is ambient noise: the baseline there becomes 0 and only the "
                    "peaks count. Each peak gets one anchor at each foot and extends until the "
                    "signal returns to the noise; outside the peaks the corrected signal is 0. "
-                   "Drag the foot anchors on the plot to adjust where each peak starts and ends."),
+                   "Drag the foot anchors on the plot to adjust where each peak starts and ends. "
+                   "Click on the curve: inside a peak, splits it in two; outside, creates a new "
+                   "peak. Right click on an anchor: removes the peak (or joins two peaks, if it "
+                   "is the anchor that splits them)."),
     "help_compare": ("Sobrepõe as baselines de todos os métodos (padrões; o selecionado usa os "
                      "seus ajustes) para ver quanto a área muda.",
                      "Overlays the baselines of all methods (defaults; the selected one uses "

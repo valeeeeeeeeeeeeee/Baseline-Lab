@@ -31,7 +31,11 @@ jobs:
         run: python -m pytest -q
 
       - name: Build executable
-        run: pyinstaller --noconsole --onefile --name "Baseline Lab" src/main.py
+        run: >
+          pyinstaller --noconsole --onefile --name "Baseline Lab"
+          --icon src/baseline_lab/icon.ico
+          --add-data "src/baseline_lab/icon.ico;baseline_lab"
+          src/main.py
 
       - name: Smoke test (the exe must start and stay open)
         shell: pwsh

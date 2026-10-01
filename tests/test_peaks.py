@@ -107,6 +107,13 @@ def test_feet_adjusted_by_the_user():
     _, out, regions, _, feet = pk.peaks_only(x, y, np.full_like(y, 0.5), feet=[60.0, 35.0])
     assert list(feet) == [35.0, 60.0] and len(regions) == 1
     assert not out[x < 35].any() and not out[x > 60].any()
+    # an anchor added inside the peak splits it in two peaks that share that foot
+    _, _, regions, _, feet = pk.peaks_only(x, y, np.full_like(y, 0.5),
+                                           feet=[35.0, 50.0, 50.0, 60.0])
+    assert len(regions) == 2 and list(feet) == [35.0, 50.0, 60.0]
+    # all anchors removed: no peak, instead of going back to the automatic ones
+    _, out, regions, _, feet = pk.peaks_only(x, y, np.full_like(y, 0.5), feet=[])
+    assert regions == [] and len(feet) == 0 and not out.any()
 
 
 def test_table_and_panel_give_the_same_area():

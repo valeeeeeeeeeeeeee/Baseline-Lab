@@ -118,7 +118,8 @@ def peaks_only(x, y, baseline, k: float = 3.0, min_height_pct: float = 5.0,
     """Applies 'peaks only' mode to a baseline already calculated by the method.
 
     `feet` (X of the feet, two per peak, in order) replaces the automatically found feet:
-    this is how the user adjusts the base of the peaks by dragging the anchors.
+    this is how the user adjusts the peaks on the plot (dragging, adding or removing anchors).
+    Two peaks may share a foot (a peak split in two); an empty list means no peak at all.
     Returns (final_baseline, peaks_only_corrected, peak_regions, noise_σ, anchors_x),
     where anchors_x are only the peak feet (two per peak)."""
     x = np.asarray(x, float)
@@ -129,7 +130,7 @@ def peaks_only(x, y, baseline, k: float = 3.0, min_height_pct: float = 5.0,
     center, sigma = noise_level(_moving_average(y - base, w))
     thr = k * sigma
     base0 = zero_near_zero(base, thr)
-    if feet is not None and len(feet) >= 2:
+    if feet is not None:
         regions = [(a, b) for a, b in _regions_from_feet(x, feet)
                    if not any(lo <= x[a + int(np.argmax(y[a:b] - base0[a:b]))] <= hi
                               for lo, hi in exclude)]
