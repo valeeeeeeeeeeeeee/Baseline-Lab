@@ -82,7 +82,7 @@ class Param:
     integer: bool = False
     log: bool = False  # control on a logarithmic scale (e.g. lambda)
     choices: tuple = ()  # if filled in, becomes a list of options
-    help: str = ""       # short explanation shown in the GUI's (i) balloon
+    help: str = ""       # short explanation shown in the GUI's help balloon
 
 
 @dataclass

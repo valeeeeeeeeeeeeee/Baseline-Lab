@@ -1,21 +1,21 @@
 """Desktop interface (Tkinter + Matplotlib).
 
 Simple flow: Import .txt -> the baseline is calculated automatically -> Export all (CSV).
-Columns, method and parameters live under "Advanced options" (hidden by default).
+Columns, method and parameters live in the "Adjustment" tool window.
 All texts come from i18n.tr(); switching the language rebuilds the interface keeping the state.
 """
 from __future__ import annotations
 
+import copy
 import pickle
 import re
-import time
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from tkinter import font as tkfont
 
 import numpy as np
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 
 from . import baselines as bl
@@ -24,6 +24,9 @@ from . import peaks as pk
 from .derivative import dtg
 from .i18n import tr
 from .io_txt import DataFile, read_file
+from .rheology_gui import RheologyPanel
+from .palettes import CalcWindow, Palette, open_palette
+from .widgets import ToolWindow, block_at, log_box, render_log, show_image
 
 COMPARE_COLORS = ["#1f77b4", "#2ca02c", "#9467bd", "#ff7f0e", "#17becf", "#8c564b",
                   "#e377c2", "#7f7f7f", "#bcbd22"]
@@ -50,10 +53,11 @@ PEAK_PARAMS = [
 
 
 class Tooltip:
-    """Help balloon that appears when the cursor rests on a widget."""
+    """Help balloon that appears when the cursor rests on a widget. `small`: a compact box
+    with a smaller font, for a balloon that is just a name."""
 
-    def __init__(self, widget, text: str, delay_ms: int = 300):
-        self.widget, self.text, self.delay = widget, text, delay_ms
+    def __init__(self, widget, text: str, delay_ms: int = 500, small: bool = False):
+        self.widget, self.text, self.delay, self.small = widget, text, delay_ms, small
         self.tip = None
         self._job = None
         widget.bind("<Enter>", self._schedule, add="+")
@@ -71,9 +75,10 @@ class Tooltip:
         self.tip = tw = tk.Toplevel(self.widget)
         tw.wm_overrideredirect(True)
         tw.attributes("-topmost", True)
-        tk.Label(tw, text=self.text, justify="left", wraplength=300, background="#fffbe6",
-                 foreground="#222", relief="solid", borderwidth=1, padx=8, pady=6,
-                 font=("Segoe UI", 9)).pack()
+        tk.Label(tw, text=self.text, justify="left", wraplength=300, background="white",
+                 foreground="#222", relief="solid", borderwidth=1,
+                 padx=4 if self.small else 8, pady=1 if self.small else 6,
+                 font=("Segoe UI", 8 if self.small else 9)).pack()
         tw.update_idletasks()
         w, h = tw.winfo_reqwidth(), tw.winfo_reqheight()
         x = self.widget.winfo_rootx() + self.widget.winfo_width() + 6
@@ -92,18 +97,11 @@ class Tooltip:
             self.tip = None
 
 
-def info_icon(parent, text: str):
-    """(i) icon with a help balloon."""
-    lbl = ttk.Label(parent, text="ⓘ", foreground="#1a6fb5", cursor="question_arrow",
-                    font=("Segoe UI Symbol", 12))
-    Tooltip(lbl, text)
-    return lbl
-
-
-def with_info(widget, text: str, **pack):
-    """Packs `widget` (child of a new Frame) with the (i) icon right next to it."""
+def with_help(widget, text: str, **pack):
+    """Packs `widget` (child of a new Frame, so the balloon only shows over its own text, not
+    over the rest of the row) with a help balloon."""
     widget.pack(side="left")
-    info_icon(widget.master, text).pack(side="left", padx=(4, 0))
+    Tooltip(widget, text)
     widget.master.pack(**pack)
     return widget
 
@@ -123,21 +121,6 @@ def guess_columns(columns: list[str]) -> tuple[int, int, bool]:
     yi = min(yi, len(columns) - 1)
     is_mass = bool(re.search(r"mass|weight|peso", low[yi]))
     return xi, yi, is_mass and low[xi].startswith("temp")
-
-
-def wheel_zoom(canvas, factor: float = 1.25):
-    """Mouse-wheel zoom, centered on the cursor (separate windows)."""
-    def on_scroll(event):
-        ax = event.inaxes
-        if ax is None or event.xdata is None:
-            return
-        scale = 1 / factor if event.button == "up" else factor
-        for get, set_, c in ((ax.get_xlim, ax.set_xlim, event.xdata),
-                             (ax.get_ylim, ax.set_ylim, event.ydata)):
-            lo, hi = get()
-            set_(c - (c - lo) * scale, c + (hi - c) * scale)
-        canvas.draw_idle()
-    canvas.mpl_connect("scroll_event", on_scroll)
 
 
 class ScrollFrame(ttk.Frame):
@@ -169,16 +152,53 @@ class ScrollFrame(ttk.Frame):
             self._canvas.yview_scroll(-1 if ev.delta > 0 else 1, "units")
 
 
-class HomeToolbar(NavigationToolbar2Tk):
-    """Plot toolbar with only "Home" (original view); zoom and pan are on the mouse."""
-    toolitems = [t for t in NavigationToolbar2Tk.toolitems if t[0] == "Home"]
+TOOL_SIZE, TOOL_PRESSED = 22, 18  # side of a header icon, in pixels: normal / of the open view
 
-    def __init__(self, canvas, window, on_home):
-        self._on_home = on_home
-        super().__init__(canvas, window)
 
-    def home(self, *_args):
-        self._on_home()
+def draw_tool_icon(c: tk.Canvas, kind: str, size: int):
+    """Draws a small square header icon on `c`, `size` pixels wide. Views - "baseline": a peak
+    over its baseline; "rheology": a flow curve through measured points. Tools - "calcs": a sum
+    sign; "peaks": a filled peak; "files": a sheet of paper; "adjust": three sliders."""
+    c.delete("all")
+    c.configure(width=size, height=size)
+    t = np.linspace(0, 1, 40)
+    lo, span = size / 6, size * 11 / 15  # drawing area, in pixels (y grows downwards)
+    pen = max(size / 14, 1.3)
+
+    def points(y, x=t):
+        return [v for xx, yy in zip(x, y) for v in (lo + xx * span, lo + (1 - yy) * span)]
+
+    if kind == "baseline":
+        base = 0.12 + 0.2 * t
+        c.create_line(points(base + 0.65 * np.exp(-((t - 0.5) / 0.14) ** 2)), fill="#d62728",
+                      width=pen)
+        c.create_line(points(base), fill="black", width=pen)
+    elif kind == "rheology":
+        c.create_line(points(0.08 + 0.85 * t ** 0.45), fill="black", width=pen)
+        r = size / 11
+        for x in (0.12, 0.45, 0.85):
+            px, py = lo + x * span, lo + (1 - (0.08 + 0.85 * x ** 0.45)) * span
+            c.create_oval(px - r, py - r, px + r, py + r, fill="#d62728", outline="black")
+    elif kind == "calcs":
+        c.create_text(size / 2 + 1, size / 2 + 1, text="Σ", fill="black",
+                      font=("Segoe UI", -round(size * 0.72), "bold"))
+    elif kind == "peaks":
+        peak = 0.1 + 0.85 * np.exp(-((t - 0.5) / 0.16) ** 2)
+        c.create_polygon(points(peak) + points([0.1, 0.1], [1, 0]), fill="#d62728", outline="")
+        c.create_line(points([0.1, 0.1], [0, 1]), fill="black", width=pen)
+    elif kind == "adjust":
+        r = size / 9
+        for y, x in ((0.82, 0.3), (0.5, 0.7), (0.18, 0.45)):  # each slider: its track and knob
+            c.create_line(points([y, y], [0, 1]), fill="black", width=pen)
+            px, py = lo + x * span, lo + (1 - y) * span
+            c.create_oval(px - r, py - r, px + r, py + r, fill="#d62728", outline="black")
+    else:  # "files": a sheet with its corner folded and two lines of text
+        sheet = [(0.18, 0), (0.62, 0), (0.84, 0.24), (0.84, 1), (0.18, 1)]
+        c.create_polygon(points([1 - y for _x, y in sheet], [x for x, _y in sheet]),
+                         fill="white", outline="black", width=pen)
+        c.create_line(points([1, 0.76, 0.76], [0.62, 0.62, 0.84]), fill="black", width=pen)
+        for y in (0.5, 0.26):
+            c.create_line(points([y, y], [0.32, 0.7]), fill="black", width=pen)
 
 
 def set_icon(window):
@@ -189,14 +209,14 @@ def set_icon(window):
         pass
 
 
-class App(tk.Tk):
-    def __init__(self, initial_files: list[str] | None = None, lang: str | None = None):
-        super().__init__()
-        i18n.set_lang(lang or i18n.load_lang())
-        self.title("Baseline Lab")
+class Program:
+    """The program's interface, on the window it is mixed into: the main one (`App`, with the top
+    bar and both views) or a `ViewWindow` (a single view, for a file opened in a new window)."""
+
+    _solo: str | None = None  # view a single-view window shows: "baseline" or "rheology"
+
+    def _init_state(self):
         set_icon(self)
-        self.geometry("1280x780")
-        self.minsize(900, 560)
         self.files: dict[str, DataFile] = {}
         # each file is independent: choices, adjustments and calculation log kept per file
         self._file_states: dict[str, dict] = {}
@@ -216,7 +236,6 @@ class App(tk.Tk):
         self._after_id = None
         self._drag = None                   # index of the anchor being dragged
         self._pan = None                    # plot drag in progress
-        self._home_view = None              # limits of the full view ("Home" button)
         self._settle_after = None           # turns the automatic layout back on when the mouse stops
         self._view_snap = None              # stored image for pan/zoom without redrawing
         self._view_after = None             # real draw when the mouse pauses
@@ -229,37 +248,49 @@ class App(tk.Tk):
         for cls in ("TCombobox", "TSpinbox"):
             self.unbind_class(cls, "<MouseWheel>")
         self._build_ui()
-        if initial_files:
-            self.after(50, lambda: self.load_files(initial_files))
 
     # ------------------------------------------------------------------ UI
     def _build_ui(self, state: dict | None = None):
         style = ttk.Style(self)
-        style.configure("Big.TButton", font=("Segoe UI", 11, "bold"), padding=(14, 6))
+        style.configure("Big.TButton", font=("Segoe UI", 11, "bold"), padding=(14, 1))
         style.configure("Title.TLabel", font=("Segoe UI", 10, "bold"))
+        style.configure("Small.Toolbutton", font=("Segoe UI", 8), padding=(4, 0))  # flat, no outline
         # table without its own (gray) border: it gets the same black outline as the other boxes
         style.layout("Treeview", [("Treeview.treearea", {"sticky": "nswe"})])
+        # sliders of the advanced options: a small black mark in place of the theme's thumb
+        # once: the interface is rebuilt on a language switch, and each window builds its own
+        if "Mark.Horizontal.Scale.slider" not in style.element_names():
+            self._mark_img = tk.PhotoImage(width=3, height=13)  # kept: Tk does not hold it
+            self._mark_img.put("black", to=(0, 0, 3, 13))
+            style.element_create("Mark.Horizontal.Scale.slider", "image", self._mark_img)
+        style.layout("Mark.Horizontal.TScale", [("Horizontal.Scale.trough", {
+            "sticky": "nswe", "children": [
+                ("Horizontal.Scale.track", {"sticky": "we"}),
+                ("Mark.Horizontal.Scale.slider", {"side": "left", "sticky": ""})]})])
 
-        # top bar: the only everyday actions
-        bar = ttk.Frame(self, padding=(8, 8, 8, 4))
-        bar.pack(side="top", fill="x")
-        ttk.Button(bar, text=tr("import_btn"), style="Big.TButton",
-                   command=self.open_files).pack(side="left")
-        self.adv_btn = ttk.Button(bar, text=tr("adv_closed"), command=self.toggle_advanced)
-        self.adv_btn.pack(side="right")
-        codes = list(i18n.LANGS)
-        self.lang_cb = ttk.Combobox(bar, state="readonly", width=15,
-                                    values=[i18n.LANGS[c] for c in codes])
-        self.lang_cb.current(codes.index(i18n.get_lang()))
-        self.lang_cb.bind("<<ComboboxSelected>>",
-                          lambda _e: self.set_language(codes[self.lang_cb.current()]))
-        self.lang_cb.pack(side="right", padx=(0, 12))
-        ttk.Label(bar, text=tr("language")).pack(side="right", padx=(0, 4))
-        ttk.Separator(self).pack(side="top", fill="x")
+        self.rheo_var = tk.BooleanVar(value=False)  # True: the rheology view is the open one
+        self._tool_icons = {}
+        if self._solo is None:  # a window of a single view has no top bar
+            self._build_bar()
 
-        # left column: files and results
-        left = ttk.Frame(self, padding=8)
-        left.pack(side="left", fill="y")
+        # the two views share the window: baseline (default) and rheology ("Tools" icons)
+        self.base_view = ttk.Frame(self)
+        self.base_view.pack(fill="both", expand=True)
+        # the main window has no side columns: what they held is reached through the tools of
+        # the top bar. A file in its own window has no tools, so it keeps the columns
+        docked = self._solo is not None
+        self._tool_wins: dict[str, tk.Toplevel] = {}   # {view: its "Adjustment" window}
+        self._tool_placed: dict[str, bool] = {}
+        self.rheo = RheologyPanel(self, (state or {}).get("rheo"), docked)
+        self.rheo.on_open_window = self._open_window
+
+        # left column: files and results. In the main window it is never shown: it only holds
+        # the lists that the "Files", "Peaks" and "Calculations" tools show
+        left = ttk.Frame(self.base_view, padding=8)
+        if docked:
+            left.pack(side="left", fill="y")
+            # line between the left column and the plot
+            ttk.Separator(self.base_view, orient="vertical").pack(side="left", fill="y")
         # the three boxes (files, results, calculations) have the same shape: a title and, below,
         # a box with its scrollbar, so the edges line up
         ttk.Label(left, text=tr("files"), style="Title.TLabel").pack(anchor="w", pady=(0, 2))
@@ -276,6 +307,9 @@ class App(tk.Tk):
         self.listbox.bind("<Delete>", lambda _e: self.remove_file())
         self.listbox.bind("<Button-3>", self._file_menu)
         self._file_menu_pop = tk.Menu(self, tearoff=0)
+        self._file_menu_pop.add_command(
+            label=tr("open_file_window"),
+            command=lambda: self.open_file_window(self._file_clicked))
         self._file_menu_pop.add_command(label=tr("remove"),
                                         command=lambda: self.remove_file(self._file_clicked))
         self._file_clicked = None  # file under the right click
@@ -292,6 +326,8 @@ class App(tk.Tk):
         self._plot_menu = tk.Menu(self, tearoff=0)
         self._plot_menu.add_command(label=tr("open_window"),
                                     command=lambda: self.open_in_window(self._menu_ax))
+        self._plot_menu.add_command(label=tr("open_image"),
+                                    command=lambda: self.open_image(self._menu_ax))
         self._plot_menu.add_command(label=tr("save_image"),
                                     command=lambda: self.save_image(self._menu_ax))
         self._menu_ax = None
@@ -317,60 +353,52 @@ class App(tk.Tk):
         self.tree.bind("<<TreeviewSelect>>", lambda _e: self._tree_select())
         self.tree.bind("<Escape>", lambda _e: self.tree.selection_set(()))
         self.tree.bind("<ButtonPress-1>", self._toggle_row)
+        # the mouse does nothing on the titles and on the column edges: no highlight under the
+        # cursor and no resize arrows (both come from the Treeview's own <Motion>)
+        self.tree.bind("<Motion>", lambda _e: "break")
         self.tree.bind("<Button-3>", self._tree_menu)
 
         # log of the area calculations (right click on the table): takes the rest of the column
         calc_head = ttk.Frame(left)
         calc_head.pack(fill="x", pady=(12, 2))
         ttk.Label(calc_head, text=tr("calcs"), style="Title.TLabel").pack(side="left")
-        clear_btn = ttk.Button(calc_head, text=tr("calcs_clear"), command=self.clear_calc_log)
+        clear_btn = ttk.Button(calc_head, text=tr("calcs_clear"), command=self.clear_calc_log,
+                               style="Small.Toolbutton", takefocus=False)
         clear_btn.pack(side="right")
-        box = ttk.Frame(left)
+        box, self.calc_log, sb = log_box(left)
         box.pack(fill="both", expand=True)
-        self.calc_log = tk.Text(box, width=1, height=4, wrap="word", font=("Segoe UI", 9),
-                                relief="solid", borderwidth=1, padx=0, pady=0, cursor="arrow")
-        self.calc_log.tag_configure("head", font=("Segoe UI", 9, "bold"))
-        self.calc_log.tag_configure("dim", foreground="#666")
-        # each calculation is a block; alternating gray background and a black line in between
-        for tag, bg in (("even", "white"), ("odd", "#ececec")):
-            self.calc_log.tag_configure(tag, background=bg, lmargin1=6, lmargin2=6, rmargin=6)
-        self.calc_log.tag_configure("first", spacing1=4)  # spacing at the top of each block
-        self.calc_log.tag_configure("last", spacing3=4)   # and at the bottom
-        # black line between one calculation and the next
-        self.calc_log.tag_configure("sep", background="black", font=("Segoe UI", 1))
-        self.calc_log.tag_configure("sel_entry", background="#cfe2ff", lmargin1=6, lmargin2=6,
-                                    rmargin=6)  # marked calculation: its area in red
-        self.calc_log.tag_lower("even")
-        self.calc_log.tag_lower("odd")
-        sb = ttk.Scrollbar(box, orient="vertical", command=self.calc_log.yview)
-        self.calc_log.configure(yscrollcommand=sb.set)
-        sb.pack(side="right", fill="y")
-        self.calc_log.pack(side="left", fill="both", expand=True)
         # the button ends at the edge of the box, not of its scrollbar
         clear_btn.pack_configure(padx=(0, sb.winfo_reqwidth()))
-        self.calc_log.bind("<Button-1>", self._log_select)
         self.calc_log.bind("<Button-3>", self._log_menu)
         self._log_menu_pop = tk.Menu(self, tearoff=0)
+        self._log_menu_pop.add_command(label=tr("calcs_copy"), command=self.copy_log_entry)
         self._log_menu_pop.add_command(label=tr("calcs_remove"), command=self.remove_log_entry)
         self._log_clicked = None  # calculation under the right click
-        # calculations done: {"lines": [(text, tags)], "lo", "hi", "pico"}; switching the language
+        # calculations done, as data (the text is written in the current language when shown):
+        # {"source", "method", "edited", "lo", "hi", "pico", "areas"}; switching the language
         # keeps them, and also which one is marked
         self._log_entries = [dict(e) for e in (state or {}).get("calc_log", [])]
-        self._log_sel = (state or {}).get("calc_sel")
         self._log_render()
 
-        # advanced panel (hidden)
-        self.adv = ScrollFrame(self)
+        if not docked:
+            # advanced options: the "Adjustment" tool, a floating window like the other tools
+            self.adv = ScrollFrame(self._tool_window("baseline", state).body)
+            self.adv.pack(fill="both", expand=True)
+        else:
+            # a file in its own window has no tools: the options are a column on the right
+            self.adv = ScrollFrame(self.base_view)
+            self.adv.pack(side="right", fill="y")
+            # line between the plot and the column, like the one of the left column
+            ttk.Separator(self.base_view, orient="vertical").pack(side="right", fill="y")
         self._build_advanced(self.adv.inner, (state or {}).get("peak_vals"))
 
         # plot
-        self.plot_frame = ttk.Frame(self)
+        self.plot_frame = ttk.Frame(self.base_view)
         self.plot_frame.pack(side="left", fill="both", expand=True)
         self.fig = Figure(figsize=(8, 6), constrained_layout=True)
         self.ax1 = self.fig.add_subplot(211)
         self.ax2 = self.fig.add_subplot(212, sharex=self.ax1)
         self.canvas = FigureCanvasTkAgg(self.fig, master=self.plot_frame)
-        HomeToolbar(self.canvas, self.plot_frame, self.reset_view).update()
         self.canvas.get_tk_widget().pack(fill="both", expand=True)
         self.canvas.mpl_connect("button_press_event", self.on_click)
         self.canvas.mpl_connect("motion_notify_event", self.on_motion)
@@ -387,11 +415,179 @@ class App(tk.Tk):
                   text=tr("empty_hint")).pack(pady=(12, 0))
         self.empty.place(relx=0.5, rely=0.45, anchor="center")
 
-        self.bind_all("<Control-o>", lambda _e: self.open_files())
+        if self._solo is None:
+            self.bind_all("<Control-o>", lambda _e: self.open_files())
         if state:
             self._restore(state)
         else:
             self.on_method_change()
+        if (state or {}).get("rheo_view"):
+            self.rheo_var.set(True)
+            self.toggle_rheology()
+
+    def _build_bar(self):
+        # top bar: the only everyday actions
+        bar = ttk.Frame(self, padding=(4, 1, 4, 1))
+        bar.pack(side="top", fill="x")
+        # "File", in the top left corner: small and without an outline, like a menu title.
+        # Load: imports files into the view that is open; Save: its plot, as a JPEG
+        file_menu = tk.Menu(self, tearoff=0)
+        file_menu.add_command(label=tr("file_load"), command=self.open_files)
+        file_menu.add_command(label=tr("file_save"), command=self.save_plot)
+        # nothing to save while the open view has no file
+        file_menu.configure(postcommand=lambda: file_menu.entryconfigure(
+            1, state="normal" if self._shown_plot()[1] else "disabled"))
+        ttk.Menubutton(bar, text=tr("file_btn"), style="Toolbutton", takefocus=False,
+                       menu=file_menu).pack(side="left", anchor="n")
+        # "Analyses", next to it: the two views, the open one checked (same as the icons)
+        analyses = tk.Menu(self, tearoff=0)
+        for rheo, name in ((False, tr("baseline")), (True, tr("rheo_btn"))):
+            analyses.add_radiobutton(label=name, value=rheo, variable=self.rheo_var,
+                                     command=self.toggle_rheology)
+        ttk.Menubutton(bar, text=tr("analyses"), style="Toolbutton", takefocus=False,
+                       menu=analyses).pack(side="left", anchor="n")
+        # "Tools": each one opens in a small floating window over the plot
+        self._tools_menu = tools_menu = tk.Menu(self, tearoff=0)
+        for kind, key in (("calcs", "tool_calc"), ("files", "tool_files")):
+            tools_menu.add_command(label=tr(key), command=lambda k=kind: open_palette(self, k))
+        # the tools that only the baseline has, under its name
+        base_tools = tk.Menu(tools_menu, tearoff=0)
+        base_tools.add_command(label=tr("tool_peaks"),
+                               command=lambda: open_palette(self, "peaks"))
+        base_tools.add_command(label=tr("tool_adjust"), command=self.open_adjust)
+        tools_menu.add_cascade(label=tr("baseline"), menu=base_tools)
+        ttk.Menubutton(bar, text=tr("tools"), style="Toolbutton", takefocus=False,
+                       menu=tools_menu).pack(side="left", anchor="n")
+        # "Options": opens a menu (the interface language)
+        options = tk.Menu(self, tearoff=0)
+        langs = tk.Menu(options, tearoff=0)
+        options.add_cascade(label=tr("language"), menu=langs)
+        self._lang_var = tk.StringVar(value=i18n.get_lang())
+        for code, name in i18n.LANGS.items():
+            # after_idle: the switch destroys this menu, so it waits for the menu to close
+            langs.add_radiobutton(label=name, value=code, variable=self._lang_var,
+                                  command=lambda c=code: self.after_idle(self.set_language, c))
+        ttk.Menubutton(bar, text=tr("options_btn"), style="Toolbutton", takefocus=False,
+                       menu=options).pack(side="left", anchor="n")
+        # middle of the bar, on its own line: one small square icon per tool and, next to them,
+        # one per view (the open one is pressed)
+        tools = ttk.Frame(bar)
+
+        def icon_cell(kind: str, name: str, command):
+            # fixed cell: the icon shrinks inside it when pressed, its neighbors do not move
+            cell = ttk.Frame(tools, width=TOOL_SIZE + 2, height=TOOL_SIZE + 2)
+            cell.pack(side="left", padx=2)
+            icon = tk.Canvas(cell, background="white", cursor="hand2", highlightthickness=1,
+                             highlightbackground="#999")
+            icon.place(relx=0.5, rely=0.5, anchor="center")
+            icon.bind("<Button-1>", lambda _e: command())
+            draw_tool_icon(icon, kind, TOOL_SIZE)
+            Tooltip(icon, name, small=True)
+            return icon
+
+        self._tool_cells = {}  # {tool: the cell of its icon}, to hide the ones of another view
+        for kind, key in (("calcs", "tool_calc"), ("peaks", "tool_peaks"),
+                          ("files", "tool_files")):
+            self._tool_cells[kind] = icon_cell(
+                kind, tr(key), lambda k=kind: open_palette(self, k)).master
+        self._tool_cells["adjust"] = icon_cell("adjust", tr("tool_adjust"),
+                                               self.open_adjust).master
+        ttk.Frame(tools, width=10).pack(side="left")  # gap between the tools and the views
+        for rheo, kind, name in ((False, "baseline", tr("baseline")),
+                                 (True, "rheology", tr("rheo_btn"))):
+            self._tool_icons[rheo] = (
+                icon_cell(kind, name, lambda r=rheo: self.select_tool(r)), kind)
+        tools.place(relx=0.5, rely=0.5, anchor="center")
+        # `place` does not make the bar taller: this strut gives it the height of the tools
+        tools.update_idletasks()  # the requested height only exists after the layout
+        ttk.Frame(bar, width=0, height=tools.winfo_reqheight()).pack(side="left")
+        self._mark_tool()
+        ttk.Separator(self).pack(side="top", fill="x")
+
+    def _tool_window(self, view: str, state: dict | None) -> ToolWindow:
+        """Floating "Adjustment" window of a view ("baseline" or "rheology"). It always exists
+        (its controls hold the settings); closing it only hides it. A language switch rebuilds
+        it where it was, open if it was open."""
+        win = ToolWindow(self, on_close=lambda: win.withdraw())
+        win.withdraw()
+        win.title(tr("tool_adjust"))
+        was_open, geom = ((state or {}).get("tool_wins") or {}).get(view, (False, None))
+        self._tool_wins[view], self._tool_placed[view] = win, bool(geom)
+        win.of_view = view  # only on screen while this is the open view
+        if geom:
+            win.geometry(geom)
+        if was_open:
+            win.deiconify()
+        return win
+
+    def open_adjust(self):
+        """Shows the "Adjustment" window (a baseline tool); the first time, at the right edge
+        of the plot."""
+        if self.rheo_var.get():
+            return
+        view = "baseline"
+        win = self._tool_wins[view]
+        if not self._tool_placed[view]:
+            self._tool_placed[view] = True
+            self.update_idletasks()
+            plot = self.plot_frame
+            w, h = 330, max(min(560, plot.winfo_height() - 60), 200)
+            x = plot.winfo_rootx() + max(plot.winfo_width() - w - 16, 0)
+            win.geometry(f"{w}x{h}+{x}+{plot.winfo_rooty() + 16}")
+        win.deiconify()
+        win.lift()
+
+    def toggle_rheology(self):
+        """Shows the view chosen in "Tools": baseline or rheology."""
+        on = self.rheo_var.get()
+        hide, show = (self.base_view, self.rheo) if on else (self.rheo, self.base_view)
+        if on:  # same left column in both views (the baseline one follows its results table)
+            self.update_idletasks()
+            self.rheo.set_side_width(self._left.winfo_reqwidth())
+        hide.pack_forget()
+        show.pack(fill="both", expand=True)
+        self._mark_tool()
+        if self._solo is None:
+            self._fit_tools()
+
+    def _fit_tools(self):
+        """The tools follow the view: "Peaks" and "Adjustment" belong to the baseline only, so
+        with rheology open their icons and menu entries are off. And every floating window
+        (tools, calculations, pictures) belongs to the view where it was opened: it is put away
+        while the other view is open and comes back with its own."""
+        rheo = self.rheo_var.get()
+        for kind, after in (("peaks", "calcs"), ("adjust", "files")):
+            cell = self._tool_cells[kind]
+            if rheo:
+                cell.pack_forget()
+            else:
+                cell.pack(side="left", padx=2, after=self._tool_cells[after])
+        self._tools_menu.entryconfigure(2, state="disabled" if rheo else "normal")  # "Baseline"
+        view = "rheology" if rheo else "baseline"
+        for win in self.winfo_children():
+            if not hasattr(win, "of_view"):  # not a floating window of a view
+                continue
+            if win.of_view != view:
+                if win.state() != "withdrawn":
+                    win.withdraw()
+                    win.parked = True
+            elif getattr(win, "parked", False):
+                win.parked = False
+                win.deiconify()
+
+    def select_tool(self, rheology: bool):
+        """Click on a "Tools" icon: opens that view."""
+        if self.rheo_var.get() != rheology:
+            self.rheo_var.set(rheology)
+            self.toggle_rheology()
+
+    def _mark_tool(self):
+        """The icon of the open view looks pressed: slightly smaller, gray, with a darker border."""
+        for rheo, (icon, kind) in self._tool_icons.items():
+            on = rheo == self.rheo_var.get()
+            draw_tool_icon(icon, kind, TOOL_PRESSED if on else TOOL_SIZE)
+            icon.configure(background="#d9d9d9" if on else "white",
+                           highlightbackground="#444" if on else "#999")
 
     def _section(self, box, title: str):
         """Section title; returns the Frame where the section content goes."""
@@ -409,11 +605,11 @@ class App(tk.Tk):
         self.x_cb.bind("<<ComboboxSelected>>", lambda _e: self.on_columns_change())
         self.y_cb.bind("<<ComboboxSelected>>", lambda _e: self.on_columns_change())
         self.deriv_var = tk.BooleanVar(value=False)
-        with_info(ttk.Checkbutton(ttk.Frame(sec), text=tr("dtg_chk"),
+        with_help(ttk.Checkbutton(ttk.Frame(sec), text=tr("dtg_chk"),
                                   variable=self.deriv_var, command=self.on_columns_change),
                   tr("help_dtg"), anchor="w", pady=(4, 0))
         self.invert_var = tk.BooleanVar(value=False)
-        with_info(ttk.Checkbutton(ttk.Frame(sec), text=tr("invert_chk"),
+        with_help(ttk.Checkbutton(ttk.Frame(sec), text=tr("invert_chk"),
                                   variable=self.invert_var, command=self.on_columns_change),
                   tr("help_invert"), anchor="w")
 
@@ -448,7 +644,7 @@ class App(tk.Tk):
         ttk.Separator(box).pack(fill="x", pady=8)
         sec = self._section(box, tr("peaks_title"))
         self.peaks_var = tk.BooleanVar(value=False)
-        with_info(ttk.Checkbutton(ttk.Frame(sec), text=tr("peaks_chk"),
+        with_help(ttk.Checkbutton(ttk.Frame(sec), text=tr("peaks_chk"),
                                   variable=self.peaks_var, command=self.refresh),
                   tr("help_peaks"), anchor="w", pady=(2, 4))
         peak_box = ttk.Frame(sec)
@@ -463,15 +659,16 @@ class App(tk.Tk):
 
         ttk.Separator(box).pack(fill="x", pady=8)
         self.compare_var = tk.BooleanVar(value=False)
-        with_info(ttk.Checkbutton(ttk.Frame(box), text=tr("compare_chk"),
+        with_help(ttk.Checkbutton(ttk.Frame(box), text=tr("compare_chk"),
                                   variable=self.compare_var, command=self.refresh),
                   tr("help_compare"), anchor="w")
 
     def _combo(self, parent, label, row, help_text):
-        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=2)
+        lbl = ttk.Label(parent, text=label)
+        lbl.grid(row=row, column=0, sticky="w", pady=2)
+        Tooltip(lbl, help_text)
         cb = ttk.Combobox(parent, state="readonly", width=22)
         cb.grid(row=row, column=1, sticky="ew", padx=(6, 0))
-        info_icon(parent, help_text).grid(row=row, column=2, padx=(4, 0))
         parent.columnconfigure(1, weight=1)
         return cb
 
@@ -484,6 +681,8 @@ class App(tk.Tk):
         if not self.ax2.get_visible():
             return
         try:
+            if not self._left.winfo_ismapped():  # left column minimized
+                return
             widget = self.canvas.get_tk_widget()
             # figure pixels -> screen pixels (the figure may be at another DPI scale)
             scale = widget.winfo_height() / self.fig.bbox.height
@@ -494,14 +693,6 @@ class App(tk.Tk):
         pad = max(0, int(round(bottom - base_y)))
         if abs(pad - self._tree_pad.winfo_reqheight()) > 1:
             self._tree_pad.configure(height=pad)
-
-    def toggle_advanced(self):
-        if self.adv.winfo_ismapped():
-            self.adv.pack_forget()
-            self.adv_btn.config(text=tr("adv_closed"))
-        else:
-            self.adv.pack(side="right", fill="y", before=self.plot_frame)
-            self.adv_btn.config(text=tr("adv_open"))
 
     # -------------------------------------------------------------- language
     def _snapshot(self) -> dict:
@@ -517,9 +708,13 @@ class App(tk.Tk):
             "edits": self.edits, "edit_sig": self._edit_sig,
             "noise_marks": list(self.noise_marks), "noise_sig": self._noise_sig,
             "peak_feet": self.peak_feet,
-            "adv": bool(self.adv.winfo_ismapped()), "adv_scroll": self.adv._canvas.yview()[0],
+            "adv_scroll": self.adv._canvas.yview()[0],
+            "tool_wins": {v: (w.state() != "withdrawn" or getattr(w, "parked", False),
+                              w.full_geometry() if self._tool_placed[v] else None)
+                          for v, w in self._tool_wins.items()},
             "tree_sel": self.tree.selection(),
-            "calc_log": list(self._log_entries), "calc_sel": self._log_sel,
+            "calc_log": list(self._log_entries),
+            "rheo": self.rheo.snapshot(), "rheo_view": self.rheo_var.get(),
         }
 
     def _restore(self, st: dict):
@@ -540,8 +735,6 @@ class App(tk.Tk):
                          (self.peaks_var, "peaks"), (self.compare_var, "compare")):
             var.set(st[key])
         self.method_var.set(st["method"])
-        if st["adv"]:
-            self.toggle_advanced()
         self._edit_sig, self.edits = st["edit_sig"], st["edits"]  # same method: they stay
         self._noise_sig, self.noise_marks = st["noise_sig"], list(st["noise_marks"])
         self.on_method_change(st["param_vals"])
@@ -550,25 +743,67 @@ class App(tk.Tk):
             self.refresh(keep_view=True)
         if st["tree_sel"]:
             self.tree.selection_set([i for i in st["tree_sel"] if self.tree.exists(i)])
-        if st["adv"]:
-            self.update_idletasks()
-            self.adv._canvas.yview_moveto(st["adv_scroll"])
+        self.update_idletasks()
+        self.adv._canvas.yview_moveto(st["adv_scroll"])
 
     def set_language(self, code: str):
         if code == i18n.get_lang():
             return
-        state = self._snapshot()
+        # the files open in their own windows change language too
+        views = [self] + [w for w in self.winfo_children() if isinstance(w, ViewWindow)]
+        states = [v._snapshot() for v in views]
         i18n.set_lang(code)
         i18n.save_lang(code)
-        self.unbind_all("<MouseWheel>")  # the new panel binds the wheel again
+        self.unbind_all("<MouseWheel>")  # the new panels bind the wheel again
+        for view, state in zip(views, states):
+            view._rebuild(state)
+
+    def _rebuild(self, state: dict):
         for w in self.winfo_children():
-            w.destroy()
+            # the other windows rebuild themselves; the floating tools follow what is shown
+            if (not isinstance(w, (ViewWindow, Palette, CalcWindow))
+                    and not getattr(w, "is_picture", False)):
+                w.destroy()
         self._build_ui(state)
+        for w in self.winfo_children():
+            if isinstance(w, CalcWindow):
+                w.retranslate()
 
     # ------------------------------------------------------------ files
+    def _shown_plot(self) -> tuple[Figure, DataFile | None]:
+        """Figure of the view that is open and the file drawn on it (None: no file)."""
+        if self.rheo_var.get():
+            return self.rheo.view.fig, self.rheo.current()
+        return self.fig, self.current()
+
+    def save_plot(self):
+        """"File > Save": the plot of the open view, as it appears on screen (with the current
+        zoom), as a JPEG wherever the user chooses."""
+        fig, df = self._shown_plot()
+        if df is None:
+            return
+        path = filedialog.asksaveasfilename(
+            parent=self, defaultextension=".jpg", filetypes=[("JPEG", "*.jpg *.jpeg")],
+            initialfile=f"{df.path.stem}.jpg", initialdir=str(df.path.parent))
+        if not path:
+            return
+        try:
+            fig.savefig(path, dpi=200, format="jpeg")
+        except OSError as exc:  # no permission, disk full...
+            messagebox.showerror(tr("file_save"), str(exc), parent=self)
+            return
+        finally:
+            # saving leaves the figure drawn at the file's resolution: until it is drawn again
+            # for the screen, clicks miss what is on it (legend entries, anchors)
+            fig.canvas.draw()
+        messagebox.showinfo(tr("file_save"), tr("image_saved", path=path), parent=self)
+
     def open_files(self):
+        if self.rheo_var.get():  # "File > Load" feeds the view that is open
+            self.rheo.open_files()
+            return
         paths = filedialog.askopenfilenames(
-            title=tr("open_title"),
+            parent=self, title=tr("open_title"),
             filetypes=[(tr("ft_text"), "*.txt *.dat *.csv *.xlsx"), (tr("ft_all"), "*.*")])
         if paths:
             self.load_files(paths)
@@ -589,7 +824,7 @@ class App(tk.Tk):
             if first_new is None:
                 first_new = self.listbox.size() - 1
         if errors:
-            messagebox.showwarning(tr("read_fail"), "\n".join(errors))
+            messagebox.showwarning(tr("read_fail"), "\n".join(errors), parent=self)
         if first_new is not None:  # show the first newly imported file
             self.listbox.selection_clear(0, "end")
             self.listbox.selection_set(first_new)
@@ -597,7 +832,7 @@ class App(tk.Tk):
             self.on_file_change()
 
     def _file_menu(self, event):
-        """Right click on a file of the list: "Remove"."""
+        """Right click on a file of the list: "Open in a new window" and "Remove"."""
         i = self.listbox.nearest(event.y)
         box = self.listbox.bbox(i) if i >= 0 else None
         if not box or not box[1] <= event.y < box[1] + box[3]:  # clicked below the last file
@@ -607,6 +842,38 @@ class App(tk.Tk):
             self._file_menu_pop.tk_popup(event.x_root, event.y_root)
         finally:
             self._file_menu_pop.grab_release()
+
+    def _select_file(self, i: int):
+        self.listbox.selection_clear(0, "end")
+        self.listbox.selection_set(i)
+        self.on_file_change()
+
+    def open_file_window(self, i: int | None):
+        """File `i` in its own window, showing the baseline view alone: plots, results,
+        calculations and options, with the file's settings (method, parameters, adjustments).
+        From there on the two windows are independent."""
+        if i is None or not 0 <= i < len(self.files):
+            return
+        key = list(self.files)[i]
+        state = self._file_state() if key == self._cur_key else self._file_states.get(key)
+        self._open_window({"view": "baseline", "key": key, "file": self.files[key],
+                           "state": copy.deepcopy(state)})
+
+    def _open_window(self, start: dict):
+        ViewWindow(self.nametowidget("."), start)  # all of them belong to the main window
+
+    def _open_start(self, start: dict):
+        """Shows the file a single-view window was opened for."""
+        key, df = start["key"], start["file"]
+        if start["view"] == "rheology":
+            self.select_tool(True)
+            self.rheo.open_start(key, df, start["cols"], start["log"])
+            return
+        self.files[key] = df
+        if start["state"]:
+            self._file_states[key] = start["state"]
+        self.listbox.insert("end", df.name)
+        self._select_file(0)
 
     def remove_file(self, i: int | None = None):
         """Removes file `i` from the list (default: the open one); the open file stays open."""
@@ -648,7 +915,7 @@ class App(tk.Tk):
         if not df:
             self.empty.place(relx=0.5, rely=0.45, anchor="center")
             self.edits, self.peak_feet, self.noise_marks = None, None, []
-            self._log_entries, self._log_sel = [], None
+            self._log_entries = []
             self._log_render()
             self.refresh()
             return
@@ -669,7 +936,7 @@ class App(tk.Tk):
             "edit_sig": self._edit_sig,
             "noise_marks": list(self.noise_marks), "noise_sig": self._noise_sig,
             "peak_feet": None if self.peak_feet is None else list(self.peak_feet),
-            "log": list(self._log_entries), "log_sel": self._log_sel,
+            "log": list(self._log_entries),
         }
 
     @staticmethod
@@ -682,7 +949,7 @@ class App(tk.Tk):
             "peak_vals": {p.key: np.log10(p.default) if p.log else p.default
                           for p in PEAK_PARAMS},
             "peaks": False, "compare": False, "edits": None, "edit_sig": None,
-            "noise_marks": [], "noise_sig": None, "peak_feet": None, "log": [], "log_sel": None,
+            "noise_marks": [], "noise_sig": None, "peak_feet": None, "log": [],
         }
 
     def _apply_file_state(self, df: DataFile, st: dict):
@@ -700,7 +967,7 @@ class App(tk.Tk):
         # the signatures match the restored controls: the adjustments still apply
         self._edit_sig, self.edits = st["edit_sig"], st["edits"]
         self._noise_sig, self.noise_marks = st["noise_sig"], list(st["noise_marks"])
-        self._log_entries, self._log_sel = list(st["log"]), st["log_sel"]
+        self._log_entries = list(st["log"])
         self._log_render()
         self.on_method_change(st["param_vals"])  # builds the parameters and redraws
         if st["peak_feet"] is not None:  # the redraw above discards the adjusted feet
@@ -774,7 +1041,7 @@ class App(tk.Tk):
         lbl = ttk.Label(head, text=label)
         lbl.pack(side="left")
         if p.help:
-            info_icon(head, i18n.param_help(p)).pack(side="left", padx=(4, 0))
+            Tooltip(lbl, i18n.param_help(p))
         if p.choices:
             var = tk.StringVar(value=p.default if value is None else value)  # internal value
             store[p.key] = var
@@ -803,11 +1070,43 @@ class App(tk.Tk):
 
         def changed(_v=None):
             show()
-            self._debounced_refresh()
+            self._throttled_refresh()
 
-        ttk.Scale(row, from_=lo, to=hi, variable=var, command=changed).pack(fill="x")
+        scale = ttk.Scale(row, from_=lo, to=hi, variable=var, command=changed,
+                          style="Mark.Horizontal.TScale")
+        scale.pack(fill="x")
+        self._bind_mark(scale, var, changed)
         var.trace_add("write", show)  # value changed by code (another file): the label follows
         show()
+
+    @staticmethod
+    def _bind_mark(scale, var, changed, reach: int = 6):
+        """Mouse on a slider: only its mark moves it (a click on the bar does nothing), and the
+        mark can be grabbed from up to `reach` pixels on each side of it."""
+        grab = []  # while dragging: distance from the mouse to the mark when it was grabbed
+
+        def press(event):
+            grab.clear()
+            dx = event.x - scale.coords()[0]
+            if abs(dx) <= reach + 1:
+                grab.append(dx)
+            return "break"  # the Scale's own click (jump along the bar) does not run
+
+        def motion(event):
+            if grab:
+                var.set(float(scale.get(event.x - grab[0], event.y)))
+                changed()
+            return "break"
+
+        def release(_event):
+            grab.clear()
+            return "break"
+
+        scale.bind("<ButtonPress-1>", press)
+        scale.bind("<B1-Motion>", motion)
+        scale.bind("<ButtonRelease-1>", release)
+        for seq in ("<ButtonPress-2>", "<ButtonPress-3>"):  # they also jump along the bar
+            scale.bind(seq, lambda _e: "break")
 
     def param_value(self, p: bl.Param, store: dict | None = None):
         v = (self.param_vars if store is None else store)[p.key].get()
@@ -1028,35 +1327,37 @@ class App(tk.Tk):
         return fig
 
     def open_in_window(self, ax):
-        """Copy of the clicked plot in its own window, with the full toolbar (zoom, save)."""
+        """Right click on a plot: the open file in its own window."""
+        sel = self.listbox.curselection()
+        if ax is None or not ax.has_data() or not sel:
+            return
+        self.open_file_window(sel[0])
+
+    def open_image(self, ax):
+        """Picture of the clicked plot, as it appears on screen (with the current zoom), in a
+        window only to look at."""
         if ax is None or not ax.has_data():
             return
-        fig = self._single_figure(ax)
-        top = tk.Toplevel(self)
-        set_icon(top)
         df = self.current()
         name = tr("signal") if ax is self.ax1 else tr("corrected_axis")
-        top.title(f"{df.name} – {name}" if df else name)
-        canvas = FigureCanvasTkAgg(fig, master=top)
-        NavigationToolbar2Tk(canvas, top).update()
-        canvas.get_tk_widget().pack(fill="both", expand=True)
-        wheel_zoom(canvas)
-        canvas.draw()
+        top = show_image(self, self._single_figure(ax), f"{df.name} – {name}" if df else name)
+        set_icon(top)
+        top.of_view = "baseline"  # only on screen while this is the open view
 
     def save_image(self, ax):
         """Saves the clicked plot as PNG, as it appears on screen (with the current zoom)."""
         if ax is None or not ax.has_data():
             return
         df = self.current()
-        part = "sinal" if ax is self.ax1 else "corrigido"
+        part = tr("fname_signal") if ax is self.ax1 else tr("fname_corrected")
         path = filedialog.asksaveasfilename(
             defaultextension=".png", filetypes=[("PNG", "*.png")],
-            initialfile=f"{df.path.stem if df else 'grafico'}_{part}.png",
-            initialdir=str(df.path.parent) if df else None)
+            initialfile=f"{df.path.stem if df else tr('fname_plot')}_{part}.png",
+            initialdir=str(df.path.parent) if df else None, parent=self)
         if not path:
             return
         self._single_figure(ax).savefig(path, dpi=200)
-        messagebox.showinfo(tr("save_image"), tr("image_saved", path=path))
+        messagebox.showinfo(tr("save_image"), tr("image_saved", path=path), parent=self)
 
     def on_motion(self, event):
         if self._pan is not None:
@@ -1197,16 +1498,6 @@ class App(tk.Tk):
         self.fig.set_layout_engine("constrained")
         self.canvas.draw_idle()
 
-    def reset_view(self):
-        """The "Home" button: goes back to the full view of the last draw."""
-        if self._home_view is None:
-            return
-        xlim, y1, y2 = self._home_view
-        self.ax1.set_xlim(xlim)
-        self.ax1.set_ylim(y1)
-        self.ax2.set_ylim(y2)
-        self.canvas.draw_idle()
-
     def on_scroll(self, event, factor: float = 1.25):
         """Mouse-wheel zoom, centered on the cursor: forward zooms in, backward zooms out.
         X is shared by the two plots; Y changes only on the plot under the mouse."""
@@ -1237,10 +1528,14 @@ class App(tk.Tk):
                 self.deriv_var.get(), self.invert_var.get())
 
     # ------------------------------------------------------------- plot
-    def _debounced_refresh(self):
-        if self._after_id:
-            self.after_cancel(self._after_id)
-        self._after_id = self.after(150, self.refresh)
+    def _throttled_refresh(self):
+        """Slider being dragged: the plot follows it, redrawn at most ~30 times per second."""
+        if self._after_id is None:
+            self._after_id = self.after(30, self._slider_redraw)
+
+    def _slider_redraw(self):
+        self._after_id = None
+        self.refresh()
 
     def refresh(self, keep_view: bool = False):
         # editing anchors must not undo the zoom; switching file/method/columns should
@@ -1258,7 +1553,7 @@ class App(tk.Tk):
         self.noise_btn.config(state="normal" if n else "disabled")
         # the peak selected in the table stays marked after editing anchors
         keep_sel = [self.events[int(i)]["pico"] for i in self.tree.selection()] if keep_view else []
-        self._curve = self._corr = self._home_view = None
+        self._curve = self._corr = None
         self.hide_area()  # the calculated area belongs to the previous result
         self._hl = []  # ax.clear() below already removes the artists
         self.anchor_lbl.config(text="")
@@ -1296,10 +1591,6 @@ class App(tk.Tk):
         self.ax2.axhline(0, color="#999", lw=0.6)
         self.ax2.set_xlabel(self.x_cb.get())
         self.ax2.set_ylabel(tr("corrected_axis"))
-        for ax in (self.ax1, self.ax2):  # translucent grid, behind the curves
-            ax.set_axisbelow(True)
-            ax.grid(True, color="#888", alpha=0.25, lw=0.6)
-        self._home_view = (self.ax1.get_xlim(), self.ax1.get_ylim(), self.ax2.get_ylim())
         if view is not None:
             self.ax1.set_xlim(view[0])
             self.ax1.set_ylim(view[1])
@@ -1308,7 +1599,7 @@ class App(tk.Tk):
             ids = [str(k) for k, e in enumerate(self.events)
                    if any(e["inicio"] <= p <= e["fim"] for p in keep_sel)]
             self.tree.selection_set(ids[:1])
-        if keep_sel or self._log_sel is not None:  # and the marked calculation in the log
+        if keep_sel:
             self.highlight_selected(draw=False)
         self.canvas.draw_idle()
 
@@ -1349,8 +1640,6 @@ class App(tk.Tk):
                                                 f"{e['fim']:.1f}", f"{e['area']:.4g}",
                                                 f"{e['area_total']:.4g}"))
         self._fit_columns()
-        if self.events and "%/" in self.y_label():
-            self.stats.config(text=tr("dtg_stats"))
         self.summary.config(text="\n".join(info))
 
     def _fit_columns(self):
@@ -1366,19 +1655,12 @@ class App(tk.Tk):
         self.tree.configure(displaycolumns=self.tree["displaycolumns"])
 
     def _tree_select(self):
-        """A peak marked in the table takes the place of the calculation marked in the log:
-        only one peak is marked at a time."""
-        if self.tree.selection() and self._log_sel is not None:
-            self._log_sel = None
-            view = self.calc_log.yview()[0]
-            self._log_render()
-            self.calc_log.yview_moveto(view)
         self.highlight_selected()
 
     def _toggle_row(self, event):
         """Clicking the already marked row unmarks the peak."""
-        if self.tree.identify_region(event.x, event.y) == "separator":
-            return "break"  # columns have automatic width: they cannot be dragged
+        if self.tree.identify_region(event.x, event.y) in ("separator", "heading"):
+            return "break"  # titles are not buttons; columns (automatic width) are not dragged
         row = self.tree.identify_row(event.y)
         if not row or self.tree.identify_region(event.x, event.y) != "cell":
             return None
@@ -1420,6 +1702,12 @@ class App(tk.Tk):
         self.noise_marks = []
         self.refresh(keep_view=True)
 
+    def restore_noise_mark(self, i: int):
+        """Undoes one noise mark of the current file: its peak counts again."""
+        if 0 <= i < len(self.noise_marks):
+            del self.noise_marks[i]
+            self.refresh(keep_view=True)
+
     def calc_area(self):
         """Calculates the areas of the peak clicked in the table and appends them to the calculation log."""
         if self._area_row is None or not self.tree.exists(self._area_row):
@@ -1428,89 +1716,67 @@ class App(tk.Tk):
         x, corr = self._corr
         a = pk.peak_areas(x, self._signal, self._curve[1], corr, e["inicio"], e["fim"])
         df = self.current()
-        source = f"{df.name} · " if df else ""
-        edited = f" · {tr('calcs_edited')}" if self.edits is not None else ""
-        lines = [(f"{time.strftime('%H:%M:%S')}  " + tr("area_title", p=f"{e['pico']:.1f}"),
-                  ("head",)),
-                 (f"{source}{i18n.method_name(self.method_var.get())}{edited}", ("dim",)),
-                 (tr("area_range", a=f"{e['inicio']:.1f}", b=f"{e['fim']:.1f}"), ("dim",))]
-        for key, label in (("peak", "area_peak"), ("signal", "area_signal"),
-                           ("baseline", "area_base")):
-            lines.append((f"  {tr(label)}: {a[key]:.5g}", ("head",) if key == "peak" else ()))
-        entry = {"lines": lines, "lo": e["inicio"], "hi": e["fim"], "pico": e["pico"]}
+        entry = {"source": df.name if df else "", "method": self.method_var.get(),
+                 "edited": self.edits is not None, "lo": e["inicio"], "hi": e["fim"],
+                 "pico": e["pico"], "areas": dict(a)}
+        CalcWindow(self, entry)  # the calculation just made, alone in its own small window
         old = [self._log_key(o) for o in self._log_entries]
         if self._log_key(entry) in old:  # repeated calculation: just shows what is already in the log
             self.calc_log.see(f"{self._log_line(old.index(self._log_key(entry)))}.0")
             return
         self._log_entries.append(entry)
         self._log_render()
-        self.calc_log.see("end")
+        self.calc_log.see("end-1c linestart")
 
     @staticmethod
-    def _log_key(entry) -> tuple:
-        """What identifies a calculation: everything except the time (start of the 1st line)."""
-        lines = entry["lines"]
-        return (lines[0][0].split("  ", 1)[-1],) + tuple(text for text, _tags in lines[1:])
+    def _log_lines(entry) -> list[tuple[str, tuple]]:
+        """(text, tags) of each line of a calculation, in the current language."""
+        source = f"{entry['source']} · " if entry["source"] else ""
+        edited = f" · {tr('calcs_edited')}" if entry["edited"] else ""
+        lines = [(tr("area_title", p=f"{entry['pico']:.1f}"), ("head",)),
+                 (f"{source}{i18n.method_name(entry['method'])}{edited}", ("dim",)),
+                 (tr("area_range", a=f"{entry['lo']:.1f}", b=f"{entry['hi']:.1f}"), ("dim",))]
+        for key, label in (("peak", "area_peak"), ("signal", "area_signal"),
+                           ("baseline", "area_base")):
+            lines.append((f"  {tr(label)}: {entry['areas'][key]:.5g}",
+                          ("head",) if key == "peak" else ()))
+        return lines
+
+    def _log_key(self, entry) -> tuple:
+        """What identifies a calculation: its text."""
+        return tuple(text for text, _tags in self._log_lines(entry))
+
+    def _log_blocks(self) -> list[list[tuple[str, tuple]]]:
+        """The calculations as blocks of (text, tags) lines, in the current language."""
+        return [self._log_lines(e) for e in self._log_entries]
 
     def _log_line(self, k: int) -> int:
-        """Log line (1 = first) where calculation k starts (one separator line before each
-        calculation but the first)."""
-        return 1 + k + sum(len(e["lines"]) for e in self._log_entries[:k])
-
-    def _log_entry_at(self, event) -> int | None:
-        """Index of the calculation under the mouse, or None (empty log)."""
-        if not self._log_entries:
-            return None
-        line = int(self.calc_log.index(f"@{event.x},{event.y}").split(".")[0])
-        starts = [self._log_line(k) for k in range(len(self._log_entries))]
-        return max(k for k, s in enumerate(starts) if s <= line)
-
-    def _log_select(self, event):
-        """Left click on a calculation: marks its area on the corrected plot, in place of the
-        peak marked in the table; clicking the same one again unmarks it."""
-        k = self._log_entry_at(event)
-        if k is None:
-            return
-        self._log_sel = None if k == self._log_sel else k
-        if self._log_sel is not None:
-            self.tree.selection_set(())  # only one peak marked at a time
-        view = self.calc_log.yview()[0]
-        self._log_render()
-        self.calc_log.yview_moveto(view)
-        self.highlight_selected()
+        """Log line (1 = first) where calculation k starts (one separator line after each
+        calculation)."""
+        return 1 + k + sum(len(b) for b in self._log_blocks()[:k])
 
     def _log_render(self):
-        """Redraws the log (read-only for the user): one block per calculation, with alternating
-        background (the marked one in blue); with no calculations, shows how to make one."""
-        log = self.calc_log
-        log.configure(state="normal")
-        log.delete("1.0", "end")
-        entries = [e["lines"] for e in self._log_entries] or [[(tr("calcs_empty"), ("dim",))]]
-        for k, lines in enumerate(entries):
-            if k:
-                log.insert("end", "\n", ("sep",))
-            stripe = "odd" if k % 2 else "even"
-            if k == self._log_sel and self._log_entries:
-                stripe = "sel_entry"
-            for j, (text, tags) in enumerate(lines):
-                edge = (("first",) if j == 0 else ()) + (("last",) if j == len(lines) - 1 else ())
-                # the line break goes inside the tag: the background reaches the right edge
-                log.insert("end", text + "\n", tuple(tags) + (stripe,) + edge)
-        log.delete("end-2c")  # no blank line after the last block
-        # the Text's own final line break takes the block's tags: background up to the right edge
-        for tag in (stripe, "last"):
-            log.tag_add(tag, "end-1c", "end")
-        log.configure(state="disabled")
+        """Redraws the log (read-only for the user): one block per calculation; with no
+        calculations, shows how to make one."""
+        render_log(self.calc_log, self._log_blocks(), tr("calcs_empty"))
 
     def _log_menu(self, event):
-        """Right click on a log calculation: "Remove entry"."""
-        self._log_clicked = self._log_entry_at(event)
+        """Right click on a log calculation: "Copy" and "Remove entry"."""
+        self._log_clicked = block_at(self.calc_log, self._log_blocks(), event)
         if self._log_clicked is None:
             return
         try:
             self._log_menu_pop.tk_popup(event.x_root, event.y_root)
         finally:
             self._log_menu_pop.grab_release()
+
+    def copy_log_entry(self):
+        """Puts the whole text of the clicked calculation on the clipboard."""
+        if self._log_clicked is None or self._log_clicked >= len(self._log_entries):
+            return
+        lines = self._log_lines(self._log_entries[self._log_clicked])
+        self.clipboard_clear()
+        self.clipboard_append("\n".join(text.strip() for text, _tags in lines))
 
     def remove_log_entry(self):
         """Removes a calculation from the log; if done again, it shows up again."""
@@ -1519,24 +1785,18 @@ class App(tk.Tk):
         view = self.calc_log.yview()[0]
         k, self._log_clicked = self._log_clicked, None
         self._log_entries.pop(k)
-        if self._log_sel is not None:  # the marked one goes with it, or changes position
-            self._log_sel = None if self._log_sel == k else self._log_sel - (self._log_sel > k)
         self._log_render()
         self.calc_log.yview_moveto(view)  # does not jump to the top
-        self.highlight_selected()
 
     def clear_calc_log(self):
         self._log_entries = []
-        self._log_sel = None
         self._log_render()
-        self.highlight_selected()
 
     def hide_area(self):
         self._area_row = None
 
     def highlight_selected(self, draw: bool = True):
-        """Marks in red, on the corrected plot, the peak selected in the events table or the
-        calculation marked in the log (over the interval where the area was calculated)."""
+        """Marks in red, on the corrected plot, the peak selected in the events table."""
         for art in self._hl:
             try:
                 art.remove()
@@ -1547,9 +1807,6 @@ class App(tk.Tk):
             x, corr = self._corr
             spans = [(e["inicio"], e["fim"], e["pico"], e["altura"])
                      for e in (self.events[int(iid)] for iid in self.tree.selection())]
-            if self._log_sel is not None and self._log_sel < len(self._log_entries):
-                c = self._log_entries[self._log_sel]
-                spans.append((c["lo"], c["hi"], c["pico"], float(np.interp(c["pico"], x, corr))))
             for lo, hi, peak, height in spans:
                 sel = (x >= lo) & (x <= hi)
                 if not sel.any():
@@ -1583,6 +1840,41 @@ class App(tk.Tk):
         self.ax2.legend(loc="best", fontsize=7)
         self.summary.config(text=tr("compare_summary"))
         self.stats.config(text="\n".join(lines) or tr("compare_need"))
+
+
+class App(Program, tk.Tk):
+    """Main window: top bar and the two views."""
+
+    def __init__(self, initial_files: list[str] | None = None, lang: str | None = None):
+        super().__init__()
+        i18n.set_lang(lang or i18n.load_lang())
+        self.title("Baseline Lab")
+        self.geometry("1280x780")
+        self.minsize(900, 560)
+        self._init_state()
+        if initial_files:
+            self.after(50, lambda: self.load_files(initial_files))
+
+
+class ViewWindow(Program, tk.Toplevel):
+    """A file in its own window: one view alone (no top bar), with its side columns."""
+
+    def __init__(self, app: App, start: dict):
+        super().__init__(app)
+        self._solo, self._name = start["view"], start["file"].name
+        self._set_title()
+        self.geometry("1180x720")
+        self.minsize(900, 560)
+        self._init_state()
+        self._open_start(start)
+
+    def _set_title(self):
+        view = tr("rheo_btn" if self._solo == "rheology" else "baseline")
+        self.title(f"{self._name} – {view}")
+
+    def _rebuild(self, state: dict):
+        super()._rebuild(state)
+        self._set_title()  # the name of the view, in the new language
 
 
 def main(argv: list[str] | None = None):
