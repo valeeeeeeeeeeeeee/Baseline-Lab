@@ -74,7 +74,7 @@ class Palette(ToolWindow):
         self.summary.pack(anchor="w", padx=6, pady=(6, 0))
         self.stats = ttk.Label(self.body, justify="left", foreground="#555")
         self.stats.pack(anchor="w", padx=6)
-        self.bind("<Configure>", self._wrap, add="+")
+        self.body.bind("<Configure>", self._wrap)
         peaks = frame = tk.Frame(self.body, borderwidth=1, relief="solid")
         frame.pack(fill="both", expand=True, padx=6, pady=6)
         self.table = ttk.Treeview(frame, show="headings", selectmode="none", takefocus=False)
@@ -105,9 +105,8 @@ class Palette(ToolWindow):
             self.noise.bind(seq, lambda _e: "break")
 
     def _wrap(self, event):
-        if event.widget is self:  # the text above the table follows the width of the window
-            for label in (self.summary, self.stats):
-                label.configure(wraplength=max(event.width - 16, 60))
+        for label in (self.summary, self.stats):  # the text above the table follows its width
+            label.configure(wraplength=max(event.width - 12, 60))
 
     def _build_files(self):
         box = ttk.Frame(self.body)
@@ -199,16 +198,19 @@ class Palette(ToolWindow):
     def _pick_file(self):
         """Click on a file: opens it in the main window."""
         sel = self.list.curselection()
-        src = self._owner().listbox
+        owner = self._owner()
+        src = owner.listbox
         if not sel or src.curselection() == sel:
             return
         src.selection_clear(0, "end")
         src.selection_set(sel[0])
         src.see(sel[0])
-        src.event_generate("<<ListboxSelect>>")
+        # called directly: the list of the main window is never shown, and an event generated
+        # on a widget that is not on screen is not delivered
+        owner.on_file_change()
 
     def _file_menu(self, event):
-        """Right click on a file: the menu of the main window ("Open in a new window", "Remove")."""
+        """Right click on a file: the menu of the main window ("Remove")."""
         i = self.list.nearest(event.y)
         box = self.list.bbox(i) if i >= 0 else None
         if not box or not box[1] <= event.y < box[1] + box[3]:  # clicked below the last file

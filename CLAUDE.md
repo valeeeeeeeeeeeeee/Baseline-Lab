@@ -21,19 +21,24 @@ Dependencies: `numpy`, `scipy`, `matplotlib` (see `requirements.txt`). The relea
 PyInstaller one-file exe made by `.github/workflows/release.yml`; it excludes unused modules by
 name, so a new standard-library or third-party import may need to be checked against that list.
 
+`__version__` is `"dev"` in the source and the workflow writes the tag into it, so only a
+released exe checks for updates (on opening, on a thread; a notice at the right end of the top
+bar). The check needs `ssl` in the exe.
+
 ## Layout
 
 ```
 src/main.py                  entry point
 src/baseline_lab/
-  gui.py           the windows: Program (shared interface), App (main), ViewWindow (a file
-                   in its own window); the whole baseline view lives here
+  gui.py           the main window: Program (the interface) and App; the whole baseline view
+                   lives here
   rheology_gui.py  FlowCurveView (plot + models table) and RheologyPanel
   palettes.py      floating tool windows: Palette (calcs / peaks / files), CalcWindow
   widgets.py       shared widgets: Header, ToolWindow, log box, picture window
   baselines.py     baseline methods        derivative.py   DTG and derivative-based anchors
   peaks.py         peak detection, areas   rheology.py     models and fitting
   io_txt.py        .txt / .csv / .xlsx reader (DataFile)
+  updates.py       update check: latest GitHub release against `__version__`
   i18n.py          every UI string, in Portuguese and English
 tests/             pytest, numeric core and i18n
 ```
@@ -41,23 +46,27 @@ tests/             pytest, numeric core and i18n
 ## How the interface is put together
 
 - `Program` is a mixin with the whole interface. `App(Program, tk.Tk)` is the main window (top
-  bar, both analyses); `ViewWindow(Program, tk.Toplevel)` shows one file with a single analysis
-  and no top bar (`_solo` is set), keeping its side columns docked.
+  bar, both analyses), the only window that shows an analysis.
 - The main window has **no side columns**. The lists still exist as widgets that are never
   packed (file list, peaks table, calculation log); the tools of the top bar show them in
-  floating windows. The baseline options live in the "Adjustment" tool window, which always
-  exists and is only hidden when closed.
+  floating windows. The options of each analysis live in its own "Adjustment" tool window,
+  which always exists and is only hidden when closed.
 - Floating windows carry `of_view` ("baseline" / "rheology"): they are hidden while the other
-  analysis is open and come back with their own (`Program._fit_tools`). "Peaks" and
-  "Adjustment" exist only for the baseline.
+  analysis is open and come back with their own (`Program._fit_tools`). "Peaks" exists
+  only for the baseline.
 - `Palette` windows do not get called by the main window: they poll it every 250 ms and redraw
   when what they show changed. Their right-click menus are the main window's own menus.
 - `ToolWindow` has no system title bar (`overrideredirect`); its `Header` gives title, minimize
   (only the header stays) and close, and on Windows the owner is set through `ctypes` so it
-  stays over the main window.
+  stays over the main window. It is resized by dragging its left, right or bottom edge.
+- **Resizing is kept light on purpose**: Tk repaints every control at each step of a drag, and a
+  figure takes a few tenths of a second to draw. `PlotCanvas` (both plots) only stretches the
+  image already drawn and does the real draw when the size stops changing; `ToolWindow` keeps
+  `body` at its size while an edge is dragged and fits it on a pause or on release. `body` is
+  placed, not packed: the window does not ask for its content's size (`fit_height`).
 - **Switching the language rebuilds the interface**: `_snapshot()` → destroy the children →
   `_build_ui(state)` → `_restore()`. Anything the user chose must go through the snapshot, or it
-  is lost on a language switch. Floating windows, `ViewWindow`s and picture windows are kept.
+  is lost on a language switch. Floating windows and picture windows are kept.
 - Per-file settings (columns, method, parameters, adjusted anchors, noise marks, calculation
   log) are stored in `_file_states` and swapped on a file switch.
 

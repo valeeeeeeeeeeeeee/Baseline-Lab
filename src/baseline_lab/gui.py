@@ -6,27 +6,28 @@ All texts come from i18n.tr(); switching the language rebuilds the interface kee
 """
 from __future__ import annotations
 
-import copy
 import pickle
 import re
+import threading
 import tkinter as tk
+import webbrowser
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from tkinter import font as tkfont
 
 import numpy as np
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 
 from . import baselines as bl
 from . import i18n
 from . import peaks as pk
+from . import updates
 from .derivative import dtg
 from .i18n import tr
 from .io_txt import DataFile, read_file
 from .rheology_gui import RheologyPanel
 from .palettes import CalcWindow, Palette, open_palette
-from .widgets import ToolWindow, block_at, log_box, render_log, show_image
+from .widgets import PlotCanvas, ToolWindow, block_at, log_box, render_log, show_image
 
 COMPARE_COLORS = ["#1f77b4", "#2ca02c", "#9467bd", "#ff7f0e", "#17becf", "#8c564b",
                   "#e377c2", "#7f7f7f", "#bcbd22"]
@@ -210,10 +211,8 @@ def set_icon(window):
 
 
 class Program:
-    """The program's interface, on the window it is mixed into: the main one (`App`, with the top
-    bar and both views) or a `ViewWindow` (a single view, for a file opened in a new window)."""
-
-    _solo: str | None = None  # view a single-view window shows: "baseline" or "rheology"
+    """The program's interface, on the window it is mixed into: the main one (`App`), with the
+    top bar and both views."""
 
     def _init_state(self):
         set_icon(self)
@@ -243,6 +242,7 @@ class Program:
         self._curve = None                  # (x, baseline) drawn, to find anchors
         self._corr = None                   # (x, corrected) drawn, to mark peaks
         self._hl: list = []                 # artists of the red marking of the selected peak
+        self._update = None                 # (version, page) of a newer release, once found
         # the mouse wheel does not change options: by default Tk switches the value of the
         # Combobox under the cursor when scrolling; without this binding the wheel only scrolls the panel
         for cls in ("TCombobox", "TSpinbox"):
@@ -255,6 +255,7 @@ class Program:
         style.configure("Big.TButton", font=("Segoe UI", 11, "bold"), padding=(14, 1))
         style.configure("Title.TLabel", font=("Segoe UI", 10, "bold"))
         style.configure("Small.Toolbutton", font=("Segoe UI", 8), padding=(4, 0))  # flat, no outline
+        style.configure("Small.TButton", font=("Segoe UI", 8), padding=(6, 0))
         # table without its own (gray) border: it gets the same black outline as the other boxes
         style.layout("Treeview", [("Treeview.treearea", {"sticky": "nswe"})])
         # sliders of the advanced options: a small black mark in place of the theme's thumb
@@ -270,27 +271,21 @@ class Program:
 
         self.rheo_var = tk.BooleanVar(value=False)  # True: the rheology view is the open one
         self._tool_icons = {}
-        if self._solo is None:  # a window of a single view has no top bar
-            self._build_bar()
+        self._build_bar()
 
         # the two views share the window: baseline (default) and rheology ("Tools" icons)
         self.base_view = ttk.Frame(self)
         self.base_view.pack(fill="both", expand=True)
-        # the main window has no side columns: what they held is reached through the tools of
-        # the top bar. A file in its own window has no tools, so it keeps the columns
-        docked = self._solo is not None
+        # the window has no side columns: what they held is reached through the tools of the
+        # top bar
         self._tool_wins: dict[str, tk.Toplevel] = {}   # {view: its "Adjustment" window}
         self._tool_placed: dict[str, bool] = {}
-        self.rheo = RheologyPanel(self, (state or {}).get("rheo"), docked)
-        self.rheo.on_open_window = self._open_window
+        self.rheo = RheologyPanel(self, self._tool_window("rheology", state).body,
+                                  (state or {}).get("rheo"))
 
-        # left column: files and results. In the main window it is never shown: it only holds
-        # the lists that the "Files", "Peaks" and "Calculations" tools show
+        # left column: files and results. It is never shown: it only holds the lists that the
+        # "Files", "Peaks" and "Calculations" tools show
         left = ttk.Frame(self.base_view, padding=8)
-        if docked:
-            left.pack(side="left", fill="y")
-            # line between the left column and the plot
-            ttk.Separator(self.base_view, orient="vertical").pack(side="left", fill="y")
         # the three boxes (files, results, calculations) have the same shape: a title and, below,
         # a box with its scrollbar, so the edges line up
         ttk.Label(left, text=tr("files"), style="Title.TLabel").pack(anchor="w", pady=(0, 2))
@@ -307,9 +302,6 @@ class Program:
         self.listbox.bind("<Delete>", lambda _e: self.remove_file())
         self.listbox.bind("<Button-3>", self._file_menu)
         self._file_menu_pop = tk.Menu(self, tearoff=0)
-        self._file_menu_pop.add_command(
-            label=tr("open_file_window"),
-            command=lambda: self.open_file_window(self._file_clicked))
         self._file_menu_pop.add_command(label=tr("remove"),
                                         command=lambda: self.remove_file(self._file_clicked))
         self._file_clicked = None  # file under the right click
@@ -324,8 +316,6 @@ class Program:
         self._tree_pad = ttk.Frame(left, height=0)
         self._tree_pad.pack(side="bottom", fill="x")
         self._plot_menu = tk.Menu(self, tearoff=0)
-        self._plot_menu.add_command(label=tr("open_window"),
-                                    command=lambda: self.open_in_window(self._menu_ax))
         self._plot_menu.add_command(label=tr("open_image"),
                                     command=lambda: self.open_image(self._menu_ax))
         self._plot_menu.add_command(label=tr("save_image"),
@@ -380,16 +370,9 @@ class Program:
         self._log_entries = [dict(e) for e in (state or {}).get("calc_log", [])]
         self._log_render()
 
-        if not docked:
-            # advanced options: the "Adjustment" tool, a floating window like the other tools
-            self.adv = ScrollFrame(self._tool_window("baseline", state).body)
-            self.adv.pack(fill="both", expand=True)
-        else:
-            # a file in its own window has no tools: the options are a column on the right
-            self.adv = ScrollFrame(self.base_view)
-            self.adv.pack(side="right", fill="y")
-            # line between the plot and the column, like the one of the left column
-            ttk.Separator(self.base_view, orient="vertical").pack(side="right", fill="y")
+        # advanced options: the "Adjustment" tool, a floating window like the other tools
+        self.adv = ScrollFrame(self._tool_window("baseline", state).body)
+        self.adv.pack(fill="both", expand=True)
         self._build_advanced(self.adv.inner, (state or {}).get("peak_vals"))
 
         # plot
@@ -398,7 +381,7 @@ class Program:
         self.fig = Figure(figsize=(8, 6), constrained_layout=True)
         self.ax1 = self.fig.add_subplot(211)
         self.ax2 = self.fig.add_subplot(212, sharex=self.ax1)
-        self.canvas = FigureCanvasTkAgg(self.fig, master=self.plot_frame)
+        self.canvas = PlotCanvas(self.fig, master=self.plot_frame)
         self.canvas.get_tk_widget().pack(fill="both", expand=True)
         self.canvas.mpl_connect("button_press_event", self.on_click)
         self.canvas.mpl_connect("motion_notify_event", self.on_motion)
@@ -415,8 +398,7 @@ class Program:
                   text=tr("empty_hint")).pack(pady=(12, 0))
         self.empty.place(relx=0.5, rely=0.45, anchor="center")
 
-        if self._solo is None:
-            self.bind_all("<Control-o>", lambda _e: self.open_files())
+        self.bind_all("<Control-o>", lambda _e: self.open_files())
         if state:
             self._restore(state)
         else:
@@ -427,7 +409,7 @@ class Program:
 
     def _build_bar(self):
         # top bar: the only everyday actions
-        bar = ttk.Frame(self, padding=(4, 1, 4, 1))
+        self._bar = bar = ttk.Frame(self, padding=(4, 1, 4, 1))
         bar.pack(side="top", fill="x")
         # "File", in the top left corner: small and without an outline, like a menu title.
         # Load: imports files into the view that is open; Save: its plot, as a JPEG
@@ -450,11 +432,10 @@ class Program:
         self._tools_menu = tools_menu = tk.Menu(self, tearoff=0)
         for kind, key in (("calcs", "tool_calc"), ("files", "tool_files")):
             tools_menu.add_command(label=tr(key), command=lambda k=kind: open_palette(self, k))
+        tools_menu.add_command(label=tr("tool_adjust"), command=self.open_adjust)
         # the tools that only the baseline has, under its name
         base_tools = tk.Menu(tools_menu, tearoff=0)
-        base_tools.add_command(label=tr("tool_peaks"),
-                               command=lambda: open_palette(self, "peaks"))
-        base_tools.add_command(label=tr("tool_adjust"), command=self.open_adjust)
+        base_tools.add_command(label=tr("tool_peaks"), command=self.open_peaks)
         tools_menu.add_cascade(label=tr("baseline"), menu=base_tools)
         ttk.Menubutton(bar, text=tr("tools"), style="Toolbutton", takefocus=False,
                        menu=tools_menu).pack(side="left", anchor="n")
@@ -469,9 +450,13 @@ class Program:
                                   command=lambda c=code: self.after_idle(self.set_language, c))
         ttk.Menubutton(bar, text=tr("options_btn"), style="Toolbutton", takefocus=False,
                        menu=options).pack(side="left", anchor="n")
-        # middle of the bar, on its own line: one small square icon per tool and, next to them,
-        # one per view (the open one is pressed)
+        # middle of the bar, on its own line: small square icons in three groups set apart by a
+        # line. Left: the tools of the open view only; middle: the tools every view has;
+        # right: one per view (the open one is pressed)
         tools = ttk.Frame(bar)
+
+        def group_line():
+            ttk.Separator(tools, orient="vertical").pack(side="left", fill="y", padx=8)
 
         def icon_cell(kind: str, name: str, command):
             # fixed cell: the icon shrinks inside it when pressed, its neighbors do not move
@@ -485,14 +470,13 @@ class Program:
             Tooltip(icon, name, small=True)
             return icon
 
-        self._tool_cells = {}  # {tool: the cell of its icon}, to hide the ones of another view
-        for kind, key in (("calcs", "tool_calc"), ("peaks", "tool_peaks"),
-                          ("files", "tool_files")):
-            self._tool_cells[kind] = icon_cell(
-                kind, tr(key), lambda k=kind: open_palette(self, k)).master
-        self._tool_cells["adjust"] = icon_cell("adjust", tr("tool_adjust"),
-                                               self.open_adjust).master
-        ttk.Frame(tools, width=10).pack(side="left")  # gap between the tools and the views
+        icon_cell("adjust", tr("tool_adjust"), self.open_adjust)
+        # {tool: its icon} of the tools only the baseline has, grayed while rheology is open
+        self._base_icons = {"peaks": icon_cell("peaks", tr("tool_peaks"), self.open_peaks)}
+        group_line()
+        for kind, key in (("calcs", "tool_calc"), ("files", "tool_files")):
+            icon_cell(kind, tr(key), lambda k=kind: open_palette(self, k))
+        group_line()
         for rheo, kind, name in ((False, "baseline", tr("baseline")),
                                  (True, "rheology", tr("rheo_btn"))):
             self._tool_icons[rheo] = (
@@ -503,6 +487,43 @@ class Program:
         ttk.Frame(bar, width=0, height=tools.winfo_reqheight()).pack(side="left")
         self._mark_tool()
         ttk.Separator(self).pack(side="top", fill="x")
+        if self._update:  # the notice comes back with the bar on a language switch
+            self._show_update()
+
+    # ------------------------------------------------------------ updates
+    def _check_update(self):
+        """Looks for a newer release without holding the window: the request runs on a thread
+        and the window picks its answer up (Tk must not be called from another thread)."""
+        found = []
+        worker = threading.Thread(target=lambda: found.append(updates.check()), daemon=True)
+        worker.start()
+
+        def poll():
+            if worker.is_alive():
+                self.after(300, poll)
+            elif found and found[0]:
+                self._update = found[0]
+                self._show_update()
+        self.after(300, poll)
+
+    def _show_update(self):
+        """Notice at the right end of the top bar: the newer release, the button that opens its
+        download page and one that puts the notice away."""
+        version, page = self._update
+        box = ttk.Frame(self._bar)
+        box.pack(side="right")
+
+        def dismiss():
+            self._update = None
+            box.destroy()
+
+        ttk.Label(box, text=tr("update_new", v=version), font=("Segoe UI", 8)).pack(side="left")
+        ttk.Button(box, text=tr("update_get"), style="Small.TButton", takefocus=False,
+                   command=lambda: webbrowser.open(page)).pack(side="left", padx=(6, 0))
+        hide = ttk.Button(box, text="×", style="Small.Toolbutton", takefocus=False,
+                          command=dismiss)
+        hide.pack(side="left")
+        Tooltip(hide, tr("update_hide"), small=True)
 
     def _tool_window(self, view: str, state: dict | None) -> ToolWindow:
         """Floating "Adjustment" window of a view ("baseline" or "rheology"). It always exists
@@ -517,21 +538,31 @@ class Program:
         if geom:
             win.geometry(geom)
         if was_open:
-            win.deiconify()
+            if view == ("rheology" if (state or {}).get("rheo_view") else "baseline"):
+                win.deiconify()
+            else:  # it comes back with its view
+                win.parked = True
         return win
 
+    def open_peaks(self):
+        """Shows the "Peaks" window (a baseline tool)."""
+        if not self.rheo_var.get():
+            open_palette(self, "peaks")
+
     def open_adjust(self):
-        """Shows the "Adjustment" window (a baseline tool); the first time, at the right edge
+        """Shows the "Adjustment" window of the open view; the first time, at the right edge
         of the plot."""
-        if self.rheo_var.get():
-            return
-        view = "baseline"
+        rheo = self.rheo_var.get()
+        view = "rheology" if rheo else "baseline"
         win = self._tool_wins[view]
         if not self._tool_placed[view]:
             self._tool_placed[view] = True
             self.update_idletasks()
-            plot = self.plot_frame
-            w, h = 330, max(min(560, plot.winfo_height() - 60), 200)
+            plot = self.rheo.view if rheo else self.plot_frame
+            if rheo:  # a few controls: as tall as they need
+                w, h = 260, win.fit_height() + 16
+            else:
+                w, h = 330, max(min(560, plot.winfo_height() - 60), 200)
             x = plot.winfo_rootx() + max(plot.winfo_width() - w - 16, 0)
             win.geometry(f"{w}x{h}+{x}+{plot.winfo_rooty() + 16}")
         win.deiconify()
@@ -547,22 +578,27 @@ class Program:
         hide.pack_forget()
         show.pack(fill="both", expand=True)
         self._mark_tool()
-        if self._solo is None:
-            self._fit_tools()
+        self._fit_tools()
 
     def _fit_tools(self):
-        """The tools follow the view: "Peaks" and "Adjustment" belong to the baseline only, so
-        with rheology open their icons and menu entries are off. And every floating window
+        """The tools follow the view: "Peaks" belongs to the baseline only, so with rheology
+        open its icon is grayed (in place: no icon of the bar ever moves) and its menu entry is
+        off. And every floating window
         (tools, calculations, pictures) belongs to the view where it was opened: it is put away
         while the other view is open and comes back with its own."""
         rheo = self.rheo_var.get()
-        for kind, after in (("peaks", "calcs"), ("adjust", "files")):
-            cell = self._tool_cells[kind]
-            if rheo:
-                cell.pack_forget()
-            else:
-                cell.pack(side="left", padx=2, after=self._tool_cells[after])
-        self._tools_menu.entryconfigure(2, state="disabled" if rheo else "normal")  # "Baseline"
+        for kind, icon in self._base_icons.items():
+            draw_tool_icon(icon, kind, TOOL_SIZE)
+            icon.configure(cursor="" if rheo else "hand2",
+                           highlightbackground="#ccc" if rheo else "#999")
+            for item in icon.find_all() if rheo else ():
+                for opt in ("fill", "outline"):
+                    try:
+                        if icon.itemcget(item, opt):
+                            icon.itemconfigure(item, **{opt: "#c4c4c4"})
+                    except tk.TclError:  # lines have no outline
+                        pass
+        self._tools_menu.entryconfigure(3, state="disabled" if rheo else "normal")  # "Baseline"
         view = "rheology" if rheo else "baseline"
         for win in self.winfo_children():
             if not hasattr(win, "of_view"):  # not a floating window of a view
@@ -749,19 +785,16 @@ class Program:
     def set_language(self, code: str):
         if code == i18n.get_lang():
             return
-        # the files open in their own windows change language too
-        views = [self] + [w for w in self.winfo_children() if isinstance(w, ViewWindow)]
-        states = [v._snapshot() for v in views]
+        state = self._snapshot()
         i18n.set_lang(code)
         i18n.save_lang(code)
         self.unbind_all("<MouseWheel>")  # the new panels bind the wheel again
-        for view, state in zip(views, states):
-            view._rebuild(state)
+        self._rebuild(state)
 
     def _rebuild(self, state: dict):
         for w in self.winfo_children():
-            # the other windows rebuild themselves; the floating tools follow what is shown
-            if (not isinstance(w, (ViewWindow, Palette, CalcWindow))
+            # the floating tools follow what is shown
+            if (not isinstance(w, (Palette, CalcWindow))
                     and not getattr(w, "is_picture", False)):
                 w.destroy()
         self._build_ui(state)
@@ -832,7 +865,7 @@ class Program:
             self.on_file_change()
 
     def _file_menu(self, event):
-        """Right click on a file of the list: "Open in a new window" and "Remove"."""
+        """Right click on a file of the list: "Remove"."""
         i = self.listbox.nearest(event.y)
         box = self.listbox.bbox(i) if i >= 0 else None
         if not box or not box[1] <= event.y < box[1] + box[3]:  # clicked below the last file
@@ -842,38 +875,6 @@ class Program:
             self._file_menu_pop.tk_popup(event.x_root, event.y_root)
         finally:
             self._file_menu_pop.grab_release()
-
-    def _select_file(self, i: int):
-        self.listbox.selection_clear(0, "end")
-        self.listbox.selection_set(i)
-        self.on_file_change()
-
-    def open_file_window(self, i: int | None):
-        """File `i` in its own window, showing the baseline view alone: plots, results,
-        calculations and options, with the file's settings (method, parameters, adjustments).
-        From there on the two windows are independent."""
-        if i is None or not 0 <= i < len(self.files):
-            return
-        key = list(self.files)[i]
-        state = self._file_state() if key == self._cur_key else self._file_states.get(key)
-        self._open_window({"view": "baseline", "key": key, "file": self.files[key],
-                           "state": copy.deepcopy(state)})
-
-    def _open_window(self, start: dict):
-        ViewWindow(self.nametowidget("."), start)  # all of them belong to the main window
-
-    def _open_start(self, start: dict):
-        """Shows the file a single-view window was opened for."""
-        key, df = start["key"], start["file"]
-        if start["view"] == "rheology":
-            self.select_tool(True)
-            self.rheo.open_start(key, df, start["cols"], start["log"])
-            return
-        self.files[key] = df
-        if start["state"]:
-            self._file_states[key] = start["state"]
-        self.listbox.insert("end", df.name)
-        self._select_file(0)
 
     def remove_file(self, i: int | None = None):
         """Removes file `i` from the list (default: the open one); the open file stays open."""
@@ -1325,13 +1326,6 @@ class Program:
         fig.set_layout_engine("constrained")
         fig.set_size_inches(8, 5)
         return fig
-
-    def open_in_window(self, ax):
-        """Right click on a plot: the open file in its own window."""
-        sel = self.listbox.curselection()
-        if ax is None or not ax.has_data() or not sel:
-            return
-        self.open_file_window(sel[0])
 
     def open_image(self, ax):
         """Picture of the clicked plot, as it appears on screen (with the current zoom), in a
@@ -1849,32 +1843,26 @@ class App(Program, tk.Tk):
         super().__init__()
         i18n.set_lang(lang or i18n.load_lang())
         self.title("Baseline Lab")
-        self.geometry("1280x780")
-        self.minsize(900, 560)
+        self.minsize(*self.MIN_SIZE)
+        self._place_reduced()
         self._init_state()
+        self._check_update()
         if initial_files:
             self.after(50, lambda: self.load_files(initial_files))
 
+    MIN_SIZE = (900, 560)
+    START_SIZE = (1100, 680)  # the most the window takes when it opens
+    START_SHARE = 0.7         # ... and the share of the screen it may take
 
-class ViewWindow(Program, tk.Toplevel):
-    """A file in its own window: one view alone (no top bar), with its side columns."""
-
-    def __init__(self, app: App, start: dict):
-        super().__init__(app)
-        self._solo, self._name = start["view"], start["file"].name
-        self._set_title()
-        self.geometry("1180x720")
-        self.minsize(900, 560)
-        self._init_state()
-        self._open_start(start)
-
-    def _set_title(self):
-        view = tr("rheo_btn" if self._solo == "rheology" else "baseline")
-        self.title(f"{self._name} – {view}")
-
-    def _rebuild(self, state: dict):
-        super()._rebuild(state)
-        self._set_title()  # the name of the view, in the new language
+    def _place_reduced(self):
+        """Opens as a reduced window in the middle of the screen: a fixed size would cover a
+        small screen entirely, as if maximized."""
+        screen = self.winfo_screenwidth(), self.winfo_screenheight()
+        w, h = (max(low, min(top, int(s * self.START_SHARE)))
+                for low, top, s in zip(self.MIN_SIZE, self.START_SIZE, screen))
+        # a little above the middle: the taskbar takes the bottom of the screen
+        x, y = (screen[0] - w) // 2, max(0, (screen[1] - h) // 2 - 20)
+        self.geometry(f"{w}x{h}+{x}+{y}")
 
 
 def main(argv: list[str] | None = None):

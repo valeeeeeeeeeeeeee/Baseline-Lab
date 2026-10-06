@@ -11,13 +11,12 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 import numpy as np
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 
 from . import rheology as rh
 from .i18n import tr
 from .io_txt import DataFile, read_file
-from .widgets import block_at, log_box, render_log, show_image
+from .widgets import PlotCanvas, block_at, log_box, render_log, show_image
 
 MODEL_COLORS = ["#1f77b4", "#2ca02c", "#9467bd", "#ff7f0e", "#17becf"]
 
@@ -46,7 +45,7 @@ def format_params(fit: rh.Fit) -> str:
 class FlowCurveView(ttk.Frame):
     """Plot of a flow curve with the fitted models and, under it, the table of the models."""
 
-    def __init__(self, parent, open_window=None):
+    def __init__(self, parent):
         super().__init__(parent)
         # table of all fitted models, under the plot (best one first)
         # white around it, like the plot: only the left column of the view is gray
@@ -73,21 +72,16 @@ class FlowCurveView(ttk.Frame):
 
         self.fig = Figure(figsize=(8, 6), constrained_layout=True)
         self.ax = self.fig.add_subplot(111)
-        self.canvas = FigureCanvasTkAgg(self.fig, master=self)
+        self.canvas = PlotCanvas(self.fig, master=self)
         self.canvas.get_tk_widget().pack(fill="both", expand=True)
         self.canvas.mpl_connect("pick_event", self._on_pick)
         self.canvas.mpl_connect("button_press_event", self._on_click)
-        self.canvas.mpl_connect("draw_event", self._place_r2)
         self._plot_menu = tk.Menu(self, tearoff=0)
-        if open_window is not None:  # given by the panel: the open file in its own window
-            self._plot_menu.add_command(label=tr("open_window"), command=open_window)
         self._plot_menu.add_command(label=tr("open_image"), command=self.open_image)
         self._plot_menu.add_command(label=tr("save_image"), command=self.save_image)
         self._df = None                     # file drawn
         self._hidden: set[str] = set()      # curves hidden by clicking on the legend
         self._curves: dict[str, tuple] = {}  # {curve: (line, its legend line, its legend text)}
-        self._r2: dict[str, object] = {}     # {model: the R² written at the end of its curve}
-
     def _on_pick(self, event):
         """Click on a legend entry: hides its curve, or shows it again."""
         key = next((k for k, arts in self._curves.items() if event.artist in arts[1:]), None)
@@ -98,7 +92,7 @@ class FlowCurveView(ttk.Frame):
         self.canvas.draw_idle()
 
     def _on_click(self, event):
-        """Right click on the plot: "Open in a new window", "Open image", "Download image"."""
+        """Right click on the plot: "Open image", "Download image"."""
         if event.button != 3 or self._df is None:
             return
         # the matplotlib event has no screen position: use the pointer's
@@ -137,34 +131,10 @@ class FlowCurveView(ttk.Frame):
         self.canvas.draw()
         messagebox.showinfo(tr("save_image"), tr("image_saved", path=path), parent=top)
 
-    def _place_r2(self, _event=None):
-        """After each draw: the curves end close together, so the R² labels of the visible ones
-        are spread vertically until they do not overlap, staying as close to their curves as
-        possible. Their place depends on the size of the plot, known only once it is drawn."""
-        shown = sorted(((self.ax.transData.transform(a.xy)[1], a) for a in self._r2.values()
-                        if a.get_visible()), key=lambda item: item[0])
-        if not shown:
-            return
-        gap = 11 * self.fig.dpi / 72  # pixels between labels: a little over the text height
-        ys = [y for y, _a in shown]
-        for i in range(1, len(ys)):
-            ys[i] = max(ys[i], ys[i - 1] + gap)
-        shift = sum(y - y0 for y, (y0, _a) in zip(ys, shown)) / len(ys)  # spread around the curves
-        moved = False
-        for y, (y0, a) in zip(ys, shown):
-            dy = round((y - shift - y0) * 72 / self.fig.dpi, 1)
-            if abs(a.xyann[1] - dy) > 0.2:
-                a.xyann = (6, dy)
-                moved = True
-        if moved:
-            self.canvas.draw_idle()
-
     def _apply_hidden(self):
         for key, (line, handle, text) in self._curves.items():
             shown = key not in self._hidden
             line.set_visible(shown)
-            if key in self._r2:
-                self._r2[key].set_visible(shown)
             for art in (handle, text):  # a hidden curve stays in the legend, faded
                 art.set_alpha(1.0 if shown else 0.3)
         self.ax.relim(visible_only=True)  # the axes fit what is left on the plot
@@ -183,7 +153,7 @@ class FlowCurveView(ttk.Frame):
         ax.set_visible(df is not None)
         if df is not self._df:  # another file: every curve is shown again
             self._df, self._hidden = df, set()
-        self._curves, self._r2 = {}, {}
+        self._curves = {}
         if df is None:
             self.canvas.draw_idle()
             return [], ""
@@ -203,11 +173,6 @@ class FlowCurveView(ttk.Frame):
                     xs, f.predict(xs), color="black" if best else MODEL_COLORS[i - 1],
                     lw=2.2 if best else 1.6, ls="-" if best else "--",
                     zorder=3 if best else 2, label=f"{f.model.name} (R² = {f.r2:.4f})")[0]
-                # its R² at the right end of the curve, in the curve's color
-                self._r2[f.model.key] = ax.annotate(
-                    f"R² = {f.r2:.4f}", (xs[-1], float(f.predict(xs[-1:])[0])), xytext=(6, 0),
-                    textcoords="offset points", va="center", fontsize=8,
-                    color=lines[f.model.key].get_color(), annotation_clip=False)
                 self.tree.insert("", "end", tags=("best",) if best else (),
                                  values=(f.model.name, f.model.equation, format_params(f),
                                          f"{f.r2:.5f}", f"{f.rmse:.4g}", f"{f.aicc:.2f}"))
@@ -231,28 +196,22 @@ class FlowCurveView(ttk.Frame):
 
 
 class RheologyPanel(ttk.Frame):
-    def __init__(self, parent, state: dict | None = None, docked: bool = True):
-        """`docked`: the view has its left column (files, options, results, calculations).
-        False, in the main window: the column is never shown, it only holds the lists that
-        the tools of the top bar show."""
+    def __init__(self, parent, opts, state: dict | None = None):
+        """`opts`: where the options go (the body of the "Adjustment" tool window)."""
         super().__init__(parent)
-        self._docked = docked
+        self._opts = opts
         st = state or {}
         self.files: dict[str, DataFile] = dict(st.get("files", {}))
         # each file keeps its own columns: {file: (X, Y)}
         self._cols: dict[str, tuple[str, str]] = dict(st.get("cols", {}))
         self._cur_key: str | None = None    # file whose columns are in the controls
-        self.on_open_window = None          # set by the window: opens a file in a new one
         self._build_ui(st)
 
     # ------------------------------------------------------------------ UI
     def _build_ui(self, st: dict):
+        # left column (files, results, calculations): never shown, it only holds the lists that
+        # the tools of the top bar show
         self._left = left = ttk.Frame(self, padding=8)
-        opts = left
-        if self._docked:
-            left.pack(side="left", fill="y")
-            # line between the left column and the plot
-            ttk.Separator(self, orient="vertical").pack(side="left", fill="y")
         ttk.Label(left, text=tr("files"), style="Title.TLabel").pack(anchor="w", pady=(0, 2))
         box = ttk.Frame(left)
         box.pack(fill="x")
@@ -267,24 +226,25 @@ class RheologyPanel(ttk.Frame):
         self.listbox.bind("<Delete>", lambda _e: self.remove_file())
         self.listbox.bind("<Button-3>", self._file_menu)
         self._file_menu_pop = tk.Menu(self, tearoff=0)
-        self._file_menu_pop.add_command(label=tr("open_file_window"),
-                                        command=lambda: self.open_in_window(self._file_clicked))
         self._file_menu_pop.add_command(label=tr("remove"),
                                         command=lambda: self.remove_file(self._file_clicked))
         self._file_clicked = None  # file under the right click
 
-        ttk.Label(opts, text=tr("data"), style="Title.TLabel").pack(anchor="w", pady=(12, 2))
+        # options: the "Adjustment" tool, a floating window like the other tools
+        opts = ttk.Frame(self._opts, padding=8)
+        opts.pack(fill="both", expand=True)
+        ttk.Label(opts, text=tr("data"), style="Title.TLabel").pack(anchor="w")
         self.x_cb = self._combo(opts, tr("rheo_col_x"))
         self.y_cb = self._combo(opts, tr("rheo_col_y"))
         self.log_var = tk.BooleanVar(value=st.get("log", False))
         ttk.Checkbutton(opts, text=tr("rheo_log"), variable=self.log_var,
                         command=self.refresh).pack(anchor="w", pady=(6, 0))
 
-        ttk.Label(opts, text=tr("rheo_best"), style="Title.TLabel").pack(anchor="w", pady=(12, 2))
-        self.best_lbl = ttk.Label(opts, wraplength=280, justify="left",
+        ttk.Label(left, text=tr("rheo_best"), style="Title.TLabel").pack(anchor="w", pady=(12, 2))
+        self.best_lbl = ttk.Label(left, wraplength=280, justify="left",
                                   font=("Segoe UI", 12, "bold"))
         self.best_lbl.pack(anchor="w")
-        self.eq_lbl = ttk.Label(opts, wraplength=280, justify="left", font=("Segoe UI", 10))
+        self.eq_lbl = ttk.Label(left, wraplength=280, justify="left", font=("Segoe UI", 10))
         self.eq_lbl.pack(anchor="w", pady=(2, 0))
 
         # the table under the plot again, as a log like the baseline's: takes the rest of the column
@@ -304,7 +264,7 @@ class RheologyPanel(ttk.Frame):
         # the button ends at the edge of the box, not of its scrollbar
         clear_btn.pack_configure(padx=(0, sb.winfo_reqwidth()))
 
-        self.view = FlowCurveView(self, self._open_current)
+        self.view = FlowCurveView(self)
         self.view.pack(side="left", fill="both", expand=True)
 
         # start screen: a big button in the middle of the plot
@@ -372,7 +332,7 @@ class RheologyPanel(ttk.Frame):
             self.on_file_change()
 
     def _file_menu(self, event):
-        """Right click on a file of the list: "Open in a new window" and "Remove"."""
+        """Right click on a file of the list: "Remove"."""
         i = self.listbox.nearest(event.y)
         box = self.listbox.bbox(i) if i >= 0 else None
         if not box or not box[1] <= event.y < box[1] + box[3]:  # clicked below the last file
@@ -388,28 +348,6 @@ class RheologyPanel(ttk.Frame):
         df = self.files[key]
         xi, yi = guess_columns(df.columns)
         return self._cols.get(key, (df.columns[xi], df.columns[yi]))
-
-    def open_in_window(self, i: int | None):
-        """File `i` in its own window, showing this view alone (plot, results, calculations),
-        with its columns; the open file stays open."""
-        if i is None or not 0 <= i < len(self.files) or self.on_open_window is None:
-            return
-        key = list(self.files)[i]
-        self.on_open_window({"view": "rheology", "key": key, "file": self.files[key],
-                             "cols": self._columns_of(key), "log": self.log_var.get()})
-
-    def _open_current(self):
-        sel = self.listbox.curselection()
-        self.open_in_window(sel[0] if sel else None)
-
-    def open_start(self, key: str, df: DataFile, cols: tuple[str, str], log: bool):
-        """Shows the file a single-view window was opened for."""
-        self.files[key] = df
-        self._cols[key] = tuple(cols)
-        self.log_var.set(log)
-        self.listbox.insert("end", df.name)
-        self.listbox.selection_set(0)
-        self.on_file_change()
 
     def remove_file(self, i: int | None = None):
         """Removes file `i` from the list (default: the open one); the open file stays open."""

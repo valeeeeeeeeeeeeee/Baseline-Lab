@@ -8,8 +8,62 @@ import sys
 import tkinter as tk
 from tkinter import ttk
 
+import numpy as np
+from matplotlib.backends import _backend_tk
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+
 
 HEADER_BG = "#d0d0d0"
+
+
+def _mouse_down() -> bool:
+    """Windows: whether the left mouse button is held (elsewhere, unknown: False)."""
+    if sys.platform != "win32":
+        return False
+    return bool(ctypes.windll.user32.GetAsyncKeyState(0x01) & 0x8000)  # VK_LBUTTON
+
+
+class PlotCanvas(FigureCanvasTkAgg):
+    """Figure canvas that stays light while its window is resized.
+
+    Redrawing a figure takes a few tenths of a second, and a window being dragged to another
+    size asks for it at every step. So at each step the image already drawn is only stretched
+    to the new size (instant), and the real draw is done once, when the size stops changing."""
+
+    PAUSE_MS = 150
+    _resizing = False
+    _resize_after = None
+
+    def resize(self, event):
+        if event.width < 2 or event.height < 2 or getattr(self, "renderer", None) is None:
+            return super().resize(event)  # nothing drawn yet to stretch
+        self._resizing = True
+        try:
+            super().resize(event)  # the figure and the image take the new size; no draw
+        finally:
+            self._resizing = False
+        # the renderer still holds the last real draw, at the size it was made for
+        old = np.asarray(self.renderer.buffer_rgba())
+        rows = np.arange(event.height) * old.shape[0] // event.height
+        cols = np.arange(event.width) * old.shape[1] // event.width
+        _backend_tk.blit(self._tkphoto, old.take(rows, 0).take(cols, 1), (0, 1, 2, 3))
+        if self._resize_after is not None:
+            self._tkcanvas.after_cancel(self._resize_after)
+        self._resize_after = self._tkcanvas.after(self.PAUSE_MS, self._resize_done)
+
+    def _resize_done(self, at=None):
+        # a step slower than the pause is not the end of the drag: while the button is held
+        # and the mouse keeps moving, the real draw would only make the window lag behind
+        here = self._tkcanvas.winfo_pointerxy()
+        if here != at and _mouse_down():
+            self._resize_after = self._tkcanvas.after(self.PAUSE_MS, self._resize_done, here)
+            return
+        self._resize_after = None
+        self.draw_idle()
+
+    def draw_idle(self):
+        if not self._resizing:
+            super().draw_idle()
 
 
 class Header(tk.Canvas):
@@ -81,9 +135,19 @@ class ToolWindow(tk.Toplevel):
     """Floating tool window, always over the window `owner`, with its own header in place of
     the system's title bar: the title, a button that minimizes it (only the header stays on
     screen; again, it opens back) and one that closes it. It is moved by dragging the header and
-    resized by the grip in its corner. The content goes in `body`."""
+    resized by dragging its left, right or bottom edge (or a bottom corner). The content goes
+    in `body`.
+
+    Laying out the controls again takes far longer than a step of the mouse. While an edge is
+    dragged only the window follows it; `body` keeps its size and is fitted to the window when
+    the mouse pauses or lets go."""
 
     HEADER = 22  # height of the header, in pixels
+    RIM = 4      # margin left around `body`: with the outline, the edge that is dragged
+    GRAB = 8     # how far from the outline a drag still resizes, where `body` is empty there
+    CORNER = 16  # ... and how far from a bottom corner it resizes both ways
+    MIN_SIZE = (160, 90)
+    PAUSE_MS = 120
     _head = None  # canvas of the header (Toplevel sets a title before it exists)
 
     def __init__(self, owner, on_close=None):
@@ -91,6 +155,9 @@ class ToolWindow(tk.Toplevel):
         self._owner_win = owner
         self.minimized = False
         self._full_height = None  # height to go back to when it is opened again
+        self._sizing = None       # edge being dragged and where the drag started
+        self._frozen = False      # `body` keeps its size while the window changes
+        self._fit_after = None
         self._on_close = on_close or self.destroy
         if sys.platform == "win32":
             self.overrideredirect(True)  # no system title bar: the header below replaces it
@@ -105,9 +172,95 @@ class ToolWindow(tk.Toplevel):
                             on_double=self.toggle_minimize)
         self._head.pack(side="top", fill="x")
         self.body = ttk.Frame(self)
-        self.body.pack(fill="both", expand=True)
-        self._grip = ttk.Sizegrip(self)
-        self._grip.place(relx=1.0, rely=1.0, anchor="se")
+        self._fit_body()
+        self.bind("<Motion>", self._edge_cursor, add="+")
+        self.bind("<Button-1>", self._size_start, add="+")
+        self.bind("<B1-Motion>", self._size_drag, add="+")
+        self.bind("<ButtonRelease-1>", self._size_end, add="+")
+
+    def _fit_body(self):
+        """`body` takes the whole window under the header, less the rim."""
+        rim = self.RIM
+        self.body.place(x=rim, y=self.HEADER, relwidth=1, relheight=1, width=-2 * rim,
+                        height=-(self.HEADER + rim))
+        self._frozen = False
+
+    def fit_height(self) -> int:
+        """Height of the window that shows the whole content (`body` is placed, so the window
+        does not ask for it by itself)."""
+        return self.HEADER + self.body.winfo_reqheight() + self.RIM + 2
+
+    # ----------------------------------------------------- resizing by the edges
+    def _edge(self, event) -> str:
+        """Edge under the mouse, as compass points ("w", "e", "s", "sw", "se"), or ""."""
+        # the events of every widget inside come here too: only the bare window counts
+        if event.widget not in (self, self.body) or self.minimized:
+            return ""
+        w, h = self.winfo_width(), self.winfo_height()
+        x, y = event.x_root - self.winfo_rootx(), event.y_root - self.winfo_rooty()
+        if y < self.HEADER:
+            return ""
+        side = "w" if x < self.GRAB else "e" if x >= w - self.GRAB else ""
+        if y >= h - self.GRAB:
+            return "s" + ("w" if x < self.CORNER else "e" if x >= w - self.CORNER else "")
+        return "s" + side if side and y >= h - self.CORNER else side
+
+    def _edge_cursor(self, event):
+        if self._sizing is None:
+            cursor = {"w": "size_we", "e": "size_we", "s": "size_ns", "sw": "size_ne_sw",
+                      "se": "size_nw_se"}.get(self._edge(event), "")
+            if self.cget("cursor") != cursor:
+                self.configure(cursor=cursor)
+
+    def _size_start(self, event):
+        edge = self._edge(event)
+        if edge:
+            self._sizing = (edge, event.x_root, event.y_root, self.winfo_x(), self.winfo_y(),
+                            self.winfo_width(), self.winfo_height())
+
+    def _size_drag(self, event):
+        if self._sizing is None:
+            return
+        edge, x0, y0, x, y, w, h = self._sizing
+        dx, dy = event.x_root - x0, event.y_root - y0
+        min_w, min_h = self.MIN_SIZE
+        if "e" in edge:
+            w = max(w + dx, min_w)
+        elif "w" in edge:  # the right edge stays where it is
+            new_w = max(w - dx, min_w)
+            x, w = x + w - new_w, new_w
+        if "s" in edge:
+            h = max(h + dy, min_h)
+        if not self._frozen:
+            self._frozen = True
+            self.body.place(relwidth=0, relheight=0, width=self.body.winfo_width(),
+                            height=self.body.winfo_height())
+        self.geometry(f"{w}x{h}+{x}+{y}")
+        if self._fit_after is not None:
+            self.after_cancel(self._fit_after)
+        self._fit_after = self.after(self.PAUSE_MS, self._size_pause, event.x_root, event.y_root)
+
+    def _size_pause(self, x_root, y_root):
+        """Fits the content if the mouse is still where its last step left it. On a slow
+        machine a step may take longer than the pause: the mouse has gone on meanwhile, and
+        fitting now would only make it later."""
+        if self._sizing is not None and self.winfo_pointerxy() != (x_root, y_root):
+            self._fit_after = self.after(self.PAUSE_MS, self._size_pause, *self.winfo_pointerxy())
+        else:
+            self._fit_after = None
+            self._size_fit()
+
+    def _size_fit(self):
+        if self._fit_after is not None:
+            self.after_cancel(self._fit_after)
+            self._fit_after = None
+        if self._frozen and not self.minimized:
+            self._fit_body()
+
+    def _size_end(self, _event):
+        if self._sizing is not None:
+            self._sizing = None
+            self._size_fit()
 
     def _own(self, _event=None):
         """Windows: makes the main window the owner of this one, so it stays over it (and only
@@ -131,13 +284,11 @@ class ToolWindow(tk.Toplevel):
         self.minimized = not self.minimized
         if self.minimized:
             self._full_height = self.winfo_height()
-            self.body.pack_forget()
-            self._grip.place_forget()
+            self.body.place_forget()
+            self.configure(cursor="")
             self.geometry(f"{self.winfo_width()}x{self.HEADER + 2}")
         else:
-            self.body.pack(fill="both", expand=True)
-            self._grip.place(relx=1.0, rely=1.0, anchor="se")
-            self._grip.lift()
+            self._fit_body()
             self.geometry(f"{self.winfo_width()}x{self._full_height}")
 
     def full_geometry(self) -> str:
