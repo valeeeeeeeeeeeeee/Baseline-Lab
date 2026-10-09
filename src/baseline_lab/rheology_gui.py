@@ -17,7 +17,7 @@ from matplotlib.figure import Figure
 from . import rheology as rh
 from .i18n import tr
 from .io_txt import DataFile, read_file
-from .widgets import (CAN_COPY_IMAGE, PlotCanvas, block_at, copy_figure, file_key, file_title,
+from .widgets import (CAN_COPY_IMAGE, Layout, PlotCanvas, block_at, copy_figure, file_key, file_title,
                       log_box, render_log, show_image)
 
 MODEL_COLORS = ["#1f77b4", "#2ca02c", "#9467bd", "#ff7f0e", "#17becf"]
@@ -50,7 +50,7 @@ class FlowCurveView(ttk.Frame):
 
     def __init__(self, parent):
         super().__init__(parent)
-        self.fig = Figure(figsize=(8, 6), constrained_layout=True)
+        self.fig = Figure(figsize=(8, 6), layout=Layout())
         self.ax = self.fig.add_subplot(111)
         self.canvas = PlotCanvas(self.fig, master=self)
         self.canvas.get_tk_widget().pack(fill="both", expand=True)

@@ -31,7 +31,8 @@ from .i18n import tr
 from .io_txt import DataFile, read_file
 from .rheology_gui import RheologyPanel
 from .palettes import CalcWindow, ColorWindow, Palette, open_palette
-from .widgets import (CAN_COPY_IMAGE, ChartWindow, PlotCanvas, ToolWindow, block_at,
+from .scipy_load import scipy_parts
+from .widgets import (CAN_COPY_IMAGE, ChartWindow, Layout, PlotCanvas, ToolWindow, block_at,
                       ZoomSlider, copy_figure, file_key, file_title, log_box, paint_icon,
                       render_log, show_image, still, title_bar)
 
@@ -57,6 +58,14 @@ PEAK_PARAMS = [
                   "dados é ignorado (em geral é artefato de borda). Não: ele é mantido, mesmo "
                   "incompleto."),
 ]
+
+
+class UnseenCanvas(FigureCanvasAgg):
+    """Canvas of the figures that are shown nowhere (the ones in use while no plot is open):
+    a request to draw them does nothing. The plain one draws right away."""
+
+    def draw_idle(self, *args, **kwargs):
+        pass
 
 
 class Tooltip:
@@ -1008,13 +1017,17 @@ class Program:
         canvas) of a TGA plot. The signal goes inside `master`; the corrected plot, a figure
         of its own with the same X axis, in the "Baseline" window, where it is only packed
         while its file is the open one. None: figures that are not shown anywhere."""
-        fig = Figure(figsize=(4, 4), constrained_layout=True)
-        fig2 = Figure(figsize=(4, 3), constrained_layout=True)
+        fig = Figure(figsize=(4, 4), layout=Layout())
+        fig2 = Figure(figsize=(4, 3), layout=Layout())
         ax1 = fig.add_subplot(111)
         ax2 = fig2.add_subplot(111, sharex=ax1)
         if master is None:
-            return fig, ax1, ax2, FigureCanvasAgg(fig), fig2, FigureCanvasAgg(fig2)
-        canvas, canvas2 = PlotCanvas(fig, master=master), PlotCanvas(fig2, master=self._corr_box)
+            return fig, ax1, ax2, UnseenCanvas(fig), fig2, UnseenCanvas(fig2)
+        canvas = PlotCanvas(fig, master=master)
+        # the corrected plot is out of sight until its file is the open one and shows its
+        # baseline; drawn on request, it would be at every change of the X axis of the signal
+        canvas2 = PlotCanvas(fig2, master=self._corr_box,
+                             on_screen=lambda: self.base_on and canvas2 is self.canvas2)
         canvas.get_tk_widget().pack(fill="both", expand=True)
         for c in (canvas, canvas2):
             for name, handler in (("button_press_event", self.on_click),
@@ -1085,6 +1098,7 @@ class Program:
 
         self.params_frame = ttk.Frame(sec)
         self.params_frame.pack(fill="x")
+        self._params_of = None  # method whose controls are in it
 
         self.anchor_frame = ttk.LabelFrame(sec, text=tr("anchors_frame"), padding=6)
         self.anchor_frame.pack(fill="x", pady=6)
@@ -1628,12 +1642,21 @@ class Program:
         m = bl.METHODS[key]
         self.mcb.current(self.method_keys.index(key))
         self.desc.config(text=i18n.method_desc(key, m.description))
-        for w in self.params_frame.winfo_children():
-            w.destroy()
-        self.params_frame.configure(height=1)  # an empty frame does not shrink on its own in Tk
-        self.param_vars.clear()
-        for p in m.params:
-            self._add_control(p, self.params_frame, self.param_vars, (values or {}).get(p.key))
+        if key == self._params_of:  # the same method (another file): its controls stay
+            for p in m.params:
+                value = (values or {}).get(p.key)
+                default = np.log10(p.default) if p.log else p.default
+                self.param_vars[p.key].set(default if value is None else value)
+        else:
+            for w in self.params_frame.winfo_children():
+                w.destroy()
+            # an empty frame does not shrink on its own in Tk
+            self.params_frame.configure(height=1)
+            self.param_vars.clear()
+            for p in m.params:
+                self._add_control(p, self.params_frame, self.param_vars,
+                                  (values or {}).get(p.key))
+            self._params_of = key
         self.refresh()
 
     def restore_default(self):
@@ -2122,7 +2145,7 @@ class Program:
     def _settle(self):
         self._settle_after = None
         for fig in (self.fig, self.fig2):
-            fig.set_layout_engine("constrained")
+            fig.set_layout_engine(Layout())
         self._draw_idle()
 
     def on_scroll(self, event, factor: float = 1.25):
@@ -2546,6 +2569,9 @@ class App(Program, tk.Tk):
         self._init_state()
         title_bar(self)
         self._check_update()
+        # scipy takes longer to import than all the rest: loaded once the window is on screen,
+        # out of its way, to be there when the first file is opened
+        self.after(200, lambda: threading.Thread(target=scipy_parts, daemon=True).start())
         if initial_files:
             self.after(50, lambda: self.load_files(initial_files))
 

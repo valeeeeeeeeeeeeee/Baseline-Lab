@@ -66,6 +66,7 @@ def peak_regions(x, corrected, k: float = 3.0, min_height_pct: float = 5.0,
     if not above.any():
         return []
     edge = center + sigma
+    feet = np.flatnonzero(~(cs > edge))  # where the signal is back at the noise level
     d = np.diff(np.concatenate([[0], above.astype(int), [0]]))
     cands = []  # (start, end, height) of each stretch above the threshold, already extended to the feet
     for a, b in zip(np.flatnonzero(d == 1), np.flatnonzero(d == -1)):
@@ -74,10 +75,9 @@ def peak_regions(x, corrected, k: float = 3.0, min_height_pct: float = 5.0,
         top_i = a + int(np.argmax(cs[a:b]))
         if any(lo <= x[top_i] <= hi for lo, hi in exclude):
             continue  # marked as noise by the user
-        while a > 0 and cs[a - 1] > edge:
-            a -= 1
-        while b < n and cs[b] > edge:
-            b += 1
+        i, j = np.searchsorted(feet, (a, b))  # the nearest foot before the stretch and after it
+        a = feet[i - 1] + 1 if i else 0
+        b = feet[j] if j < feet.size else n
         if x[b - 1] - x[a] < min_width:
             continue  # too narrow to be a peak: noise
         cands.append((a, b, float(cs[top_i]) - center))

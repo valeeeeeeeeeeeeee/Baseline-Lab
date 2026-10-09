@@ -59,11 +59,19 @@ def modpoly(x, y, degree: int = 3, max_iter: int = 100, tol: float = 1e-3, **_):
     xs = (x - x.mean()) / (x.std() or 1.0)  # normalize: avoids ill-conditioning
     yw = y.astype(float).copy()
     base = yw
+    # the least-squares fit, as np.polyfit does it. Only the values change from one iteration
+    # to the next: the matrix that gives the coefficients from them is worked out once
+    powers = np.vander(xs, int(degree) + 1)
+    scale = np.sqrt((powers * powers).sum(axis=0))
+    solve = np.linalg.pinv(powers / scale, rcond=len(xs) * np.finfo(float).eps).T / scale
+
+    def norm(v):  # not np.linalg.norm: on long vectors it spends more starting threads than adding
+        return float(np.sqrt(np.square(v).sum()))
+
     for _i in range(max_iter):
-        coefs = np.polyfit(xs, yw, degree)
-        base = np.polyval(coefs, xs)
+        base = powers @ (yw @ solve)
         new = np.minimum(yw, base)
-        if np.linalg.norm(new - yw) / (np.linalg.norm(yw) or 1.0) < tol:
+        if norm(new - yw) / (norm(yw) or 1.0) < tol:
             break
         yw = new
     return base

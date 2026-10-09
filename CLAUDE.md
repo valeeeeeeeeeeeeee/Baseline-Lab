@@ -22,6 +22,11 @@ Dependencies: `numpy`, `scipy`, `matplotlib` (see `requirements.txt`). The relea
 PyInstaller one-file exe made by `.github/workflows/release.yml`; it excludes unused modules by
 name, so a new standard-library or third-party import may need to be checked against that list.
 
+`scipy` takes longer to import than everything else together, so no module imports it at the
+top: its parts come from `scipy_load.scipy_parts()` where they are used, and the main window
+loads them on a thread once it is on screen. The imports there are literal ones, which is how
+PyInstaller finds them.
+
 `__version__` is `"dev"` in the source and the workflow writes the tag into it, so only a
 released exe checks for updates (on opening, on a thread; a notice at the right end of the top
 bar). The check needs `ssl` in the exe.
@@ -41,6 +46,7 @@ src/baseline_lab/
   baselines.py     baseline methods        derivative.py   DTG and derivative-based anchors
   peaks.py         peak detection, areas   rheology.py     models and fitting
   io_txt.py        .txt / .csv / .xlsx reader (DataFile)
+  scipy_load.py    scipy, imported on first use (`scipy_parts`)
   updates.py       update check: latest GitHub release against `__version__`
   i18n.py          every UI string, in Portuguese and English
   theme.py         light and dark themes: the colors of the interface, by role
@@ -108,6 +114,14 @@ tests/             pytest, numeric core and i18n
   image already drawn and does the real draw when the size stops changing; `ToolWindow` keeps
   `body` at its size while an edge is dragged and fits it on a pause or on release. `body` is
   placed, not packed: the window does not ask for its content's size (`fit_height`).
+- **A figure is drawn as seldom as it can be**, and its layout worked out less still. The
+  constrained layout is most of a draw: `widgets.Layout` keeps the one it made until what it
+  depends on changes (`_state`: size, limits, titles, texts, legend), so whatever else may
+  stick out of the axes has to be added there. A `PlotCanvas` is not drawn before it has its
+  place in the window (taking it asks for the draw) nor while its `on_screen()` says no: the
+  corrected plot of a file that is not showing its baseline, which matplotlib would draw at
+  every change of the X axis it shares with the signal. The figures in use while no plot is
+  open are on an `UnseenCanvas`, never drawn.
 - **Switching the language rebuilds the interface**: `_snapshot()` → destroy the children →
   `_build_ui(state)` → `_restore()`. Anything the user chose must go through the snapshot, or it
   is lost on a language switch (the plots' places on the board and the selected one included).

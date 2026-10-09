@@ -10,9 +10,9 @@ from dataclasses import dataclass
 from typing import Callable
 
 import numpy as np
-from scipy.optimize import curve_fit
 
 from .i18n import tr
+from .scipy_load import scipy_parts
 
 MIN_POINTS = 4  # distinct shear rates needed to fit anything
 
@@ -128,6 +128,7 @@ def fit_model(model: Model, x, y) -> Fit | None:
     scale = float(np.abs(y).max()) or 1.0
     back = np.array([1.0 if s == "n" else scale for s in model.symbols])
     best, best_sse = None, np.inf
+    curve_fit = scipy_parts().optimize.curve_fit
     for p0 in model.guesses(x, y / scale):
         p0 = np.clip(p0, 1e-9, [min(u, 1e300) for u in model.upper])
         try:

@@ -25,6 +25,22 @@ def test_polynomial_recovers_background():
     assert corr.max() > 30
 
 
+@pytest.mark.parametrize("degree", [1, 3, 8])
+def test_polynomial_is_the_fit_repeated(degree):
+    """The fit is solved once for all the iterations: the baseline is the one of fitting the
+    polynomial again at each of them."""
+    x, y, _background = _signal()
+    xs = (x - x.mean()) / x.std()
+    yw = y.copy()
+    for _ in range(100):
+        base = np.polyval(np.polyfit(xs, yw, degree), xs)
+        new = np.minimum(yw, base)
+        if np.linalg.norm(new - yw) / np.linalg.norm(yw) < 1e-3:
+            break
+        yw = new
+    np.testing.assert_allclose(bl.modpoly(x, y, degree=degree), base, rtol=1e-8, atol=1e-8)
+
+
 def test_method_list():
     assert list(bl.METHODS) == ["Derivada 1ª + 2ª", "Derivada 2ª (zeros)", "Derivada 2ª (picos)",
                                 "Polinomial iterativo"]

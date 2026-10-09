@@ -11,11 +11,10 @@ even when X is not perfectly uniform (e.g. measured temperature).
 from __future__ import annotations
 
 import numpy as np
-from scipy.interpolate import CubicSpline, PchipInterpolator
-from scipy.signal import find_peaks, savgol_filter
 
 from .i18n import tr
 from .peaks import peak_regions
+from .scipy_load import scipy_parts
 
 
 # ----------------------------------------------------------------- derivatives
@@ -46,6 +45,7 @@ def smooth_derivatives(x, y, smooth_pct: float = 1.0, polyorder: int = 2):
     xg, yg = _uniform_grid(x, y)
     h = xg[1] - xg[0]
     w = _window(len(xg), smooth_pct)
+    savgol_filter = scipy_parts().signal.savgol_filter
     ys = savgol_filter(yg, w, polyorder)
     d1 = savgol_filter(yg, w, polyorder, deriv=1, delta=h)
     d2 = savgol_filter(d1, w, polyorder, deriv=1, delta=h)  # 2nd from the already smooth 1st
@@ -85,9 +85,9 @@ def _pick_from_runs(x, mask, n_anchors, min_run):
     picks = []
     for lo, hi in zip(edges[:-1], edges[1:]):
         best, best_len = None, 0
+        i0, i1 = np.searchsorted(x, lo), np.searchsorted(x, hi, side="right")
         for a, b in runs:
-            ia = max(a, np.searchsorted(x, lo))
-            ib = min(b, np.searchsorted(x, hi, side="right"))
+            ia, ib = max(a, i0), min(b, i1)
             if ib - ia > best_len:
                 best, best_len = (ia + ib - 1) // 2, ib - ia
         if best is not None:
@@ -118,6 +118,7 @@ def find_anchors(x, y, mode: str, smooth_pct=1.0, tol_pct=5.0, tol1_pct=5.0,
         idx = _pick_from_runs(x, mask, int(n_anchors), min_run)
     elif mode == "peaks":
         # edges get the minimum (not -inf, which would make the prominences infinite)
+        find_peaks = scipy_parts().signal.find_peaks
         pk, props = find_peaks(np.where(inner, d2, d2[inner].min()),
                                height=0, prominence=tol_pct / 100.0 * ref2, distance=w)
         order = np.argsort(props["prominences"])[::-1][: int(n_anchors)]
@@ -146,9 +147,10 @@ def interp_baseline(x, ax, ay, interp="linear"):
     if interp == "linear" or len(ax) < 3:
         return np.interp(x, ax, ay)
     if interp == "spline (PCHIP)":
-        f = PchipInterpolator(ax, ay)  # does not overshoot the anchor values
+        f = scipy_parts().interpolate.PchipInterpolator(ax, ay)  # does not overshoot the anchor values
     elif interp == "spline (cúbica natural)":
-        f = CubicSpline(ax, ay, bc_type="natural")  # continuous curvature; may overshoot the anchors
+        # continuous curvature; may overshoot the anchors
+        f = scipy_parts().interpolate.CubicSpline(ax, ay, bc_type="natural")
     else:
         raise ValueError(interp)
     return f(np.clip(x, ax[0], ax[-1]))

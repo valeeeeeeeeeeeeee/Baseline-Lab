@@ -15,6 +15,7 @@ from tkinter import ttk
 import numpy as np
 from matplotlib.backends import _backend_tk
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.layout_engine import ConstrainedLayoutEngine
 from PIL import Image, ImageDraw
 
 from . import theme
@@ -25,6 +26,39 @@ def _mouse_down() -> bool:
     if sys.platform != "win32":
         return False
     return bool(ctypes.windll.user32.GetAsyncKeyState(0x01) & 0x8000)  # VK_LBUTTON
+
+
+class Layout(ConstrainedLayoutEngine):
+    """Constrained layout of a figure, worked out again only when what it depends on changed.
+
+    It is most of the time a draw takes (every tick label is measured, twice), and most draws
+    change nothing it looks at: an anchor dragged, a peak marked or painted, a curve hidden."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._made = None  # what the layout in force was made for
+
+    def execute(self, fig):
+        state = self._state(fig)
+        if state != self._made:
+            super().execute(fig)
+            self._made = state
+
+    @staticmethod
+    def _state(fig) -> tuple:
+        """What sets the room the axes need around them: the size of the figure, the limits
+        and scales (the tick labels come from them), the titles and what is not clipped to
+        the axes (the texts and the legend)."""
+        def texts(ax):
+            legend = ax.get_legend()
+            return ([(t.get_text(), t.get_position(), getattr(t, "xy", None), t.get_visible())
+                     for t in ax.texts]
+                    + [t.get_text() for t in (legend.get_texts() if legend else ())])
+
+        return (fig.bbox.size.tolist(), fig.dpi,
+                [(ax.get_visible(), ax.get_xlim(), ax.get_ylim(), ax.get_xscale(),
+                  ax.get_yscale(), ax.get_title(), ax.get_xlabel(), ax.get_ylabel(), texts(ax))
+                 for ax in fig.axes])
 
 
 class PlotCanvas(FigureCanvasTkAgg):
@@ -39,8 +73,12 @@ class PlotCanvas(FigureCanvasTkAgg):
     _resize_after = None
     _all: weakref.WeakSet = weakref.WeakSet()  # every canvas there is
 
-    def __init__(self, figure, master):
+    def __init__(self, figure, master, on_screen=None):
+        """`on_screen()`: whether the plot is to be seen now (default: always). While it is
+        not, nothing draws it: matplotlib itself asks for a draw at every change of an axis
+        shared with another figure."""
         self._dpi = figure.dpi  # of the figure at 100% zoom
+        self._on_screen = on_screen or (lambda: True)
         super().__init__(figure, master=master)
         self._all.add(self)
 
@@ -98,8 +136,15 @@ class PlotCanvas(FigureCanvasTkAgg):
         self.draw_idle()
 
     def draw_idle(self):
-        if not self._resizing:
-            super().draw_idle()
+        if self._resizing or not self._on_screen():
+            return
+        # never drawn and not yet at its place in the window: taking it asks for a draw
+        # (`resize`), and one made now, at another size, would only be thrown away
+        if getattr(self, "renderer", None) is None:
+            size = self._tkcanvas.winfo_width(), self._tkcanvas.winfo_height()
+            if size != tuple(round(v) for v in self.figure.bbox.size):
+                return
+        super().draw_idle()
 
     def close(self):
         """Cancels the draws it still has scheduled: its widget is about to be destroyed."""
@@ -485,8 +530,9 @@ class ToolWindow(tk.Toplevel):
             self._sizing = None
             self._size_fit()
 
-    def _own(self, _event=None):
-        _own(self, self._owner_win)
+    def _own(self, event=None):
+        if event is None or event.widget is self:  # every widget inside sends its <Map> here
+            _own(self, self._owner_win)
 
     def title(self, text=None):
         if text is not None and self._head is not None:
