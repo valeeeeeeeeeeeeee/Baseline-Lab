@@ -25,22 +25,31 @@ def set_lang(code: str) -> None:
     _lang = code
 
 
+def load_setting(key: str, default: str) -> str:
+    """A choice saved in the last session (`default`: none saved, or nothing to read)."""
+    try:
+        return json.loads(_CONFIG.read_text(encoding="utf-8")).get(key, default)
+    except (OSError, ValueError, AttributeError):
+        return default
+
+
+def save_setting(key: str, value: str) -> None:
+    try:
+        data = json.loads(_CONFIG.read_text(encoding="utf-8")) if _CONFIG.exists() else {}
+        data[key] = value
+        _CONFIG.write_text(json.dumps(data), encoding="utf-8")
+    except (OSError, ValueError):
+        pass  # no write permission: the choice just isn't saved
+
+
 def load_lang() -> str:
     """Language saved in the last session (default: Portuguese)."""
-    try:
-        code = json.loads(_CONFIG.read_text(encoding="utf-8")).get("lang", "pt")
-    except (OSError, ValueError, AttributeError):
-        return "pt"
+    code = load_setting("lang", "pt")
     return code if code in LANGS else "pt"
 
 
 def save_lang(code: str) -> None:
-    try:
-        data = json.loads(_CONFIG.read_text(encoding="utf-8")) if _CONFIG.exists() else {}
-        data["lang"] = code
-        _CONFIG.write_text(json.dumps(data), encoding="utf-8")
-    except (OSError, ValueError):
-        pass  # no write permission: the language just isn't saved
+    save_setting("lang", code)
 
 
 def tr(key: str, **kw) -> str:
@@ -79,15 +88,32 @@ STRINGS: dict[str, tuple[str, str]] = {
     "update_new": ("Nova versão {v} disponível", "New version {v} available"),
     "update_get": ("Baixar", "Download"),
     "update_hide": ("Dispensar", "Dismiss"),
-    "import_btn": ("📂  Importar", "📂  Import"),
+    "board_hint": ("Clique em Baseline ou Reologia, na barra acima, para abrir um gráfico.\n"
+                   "Selecione um gráfico para usar os ajustes e as ferramentas nele.",
+                   "Click Baseline or Rheology, on the bar above, to open a plot.\n"
+                   "Select a plot to use the adjustments and the tools on it."),
+    "sheet_new": ("Novo sheet", "New sheet"),
+    "sheet_rename": ("Renomear", "Rename"),
+    "sheet_close": ("Fechar", "Close"),
+    "sheet_close_ask": ("Fechar \"{name}\" e os {n} gráfico(s) que estão nele?",
+                        "Close \"{name}\" and the {n} plot(s) on it?"),
+    "add_plot": ("{name}: abrir gráfico", "{name}: open a plot"),
     "tools": ("Ferramentas", "Tools"),
+    "go_back": ("Voltar: desfaz a última alteração", "Back: undo the last change"),
+    "go_forward": ("Avançar: refaz a alteração desfeita", "Forward: redo the undone change"),
     "analyses": ("Análises", "Analyses"),
     "tool_calc": ("Cálculo", "Calculations"),
     "tool_peaks": ("Picos", "Peaks"),
     "tool_files": ("Arquivos", "Files"),
     "tool_adjust": ("Ajuste", "Adjustment"),
+    "tool_baseline": ("Baseline", "Baseline"),
+    "tga": ("TGA", "TGA"),
+    "tool_models": ("Modelos", "Models"),
     "options_btn": ("Opções", "Options"),
     "language": ("Idioma", "Language"),
+    "theme": ("Tema", "Theme"),
+    "theme_light": ("Claro", "Light"),
+    "theme_dark": ("Escuro", "Dark"),
     "files": ("Arquivos", "Files"),
     "remove": ("Remover", "Remove"),
     "result": ("Resultado", "Results"),
@@ -96,12 +122,6 @@ STRINGS: dict[str, tuple[str, str]] = {
     "col_end": ("Fim", "End"),
     "col_event": ("Evento", "Event"),
     "col_total": ("Total", "Total"),
-    "empty_title": ("Importe seus arquivos .txt para calcular a baseline",
-                    "Import your .txt files to calculate the baseline"),
-    "empty_hint": ("Colunas, separador e vírgula decimal são detectados sozinhos.\n"
-                   "Vários arquivos de uma vez: segure Ctrl ao selecionar.",
-                   "Columns, delimiter and decimal comma are detected automatically.\n"
-                   "Several files at once: hold Ctrl while selecting."),
     # advanced options
     "data": ("Dados", "Data"),
     "col_x": ("Coluna X", "X column"),
@@ -179,12 +199,19 @@ STRINGS: dict[str, tuple[str, str]] = {
     "total_area": ("Área corrigida total: {a}", "Total corrected area: {a}"),
     "calc_area": ("Calcular área", "Calculate area"),
     "mark_noise": ("Marcar como ruído", "Mark as noise"),
+    "paint_peak": ("Colorir", "Color"),
+    "paint_all": ("Colorir todos", "Color all"),
+    "paint_title": ("Cor do pico", "Peak color"),
+    "paint_none": ("Sem cor", "No color"),
+    "paint_hex": ("Hex", "Hex"),
+    "paint_alpha": ("Transparência - Alpha", "Transparency - Alpha"),
     "restore_noise": ("Restaurar picos marcados como ruído", "Restore peaks marked as noise"),
     "noise_list": ("Marcados como ruído", "Marked as noise"),
     "noise_restore_one": ("Restaurar pico", "Restore peak"),
     "noise_marked": ("{n} pico(s) marcado(s) como ruído", "{n} peak(s) marked as noise"),
     "open_image": ("Abrir imagem", "Open image"),
     "save_image": ("Baixar imagem", "Download image"),
+    "copy_image": ("Copiar imagem", "Copy image"),
     "image_saved": ("Imagem salva em:\n{path}", "Image saved to:\n{path}"),
     "area_title": ("Área do pico em {p}", "Area of the peak at {p}"),
     "area_range": ("Entre {a} e {b} (unidade Y × unidade X)",
@@ -212,12 +239,6 @@ STRINGS: dict[str, tuple[str, str]] = {
                      "Place anchors to include these methods."),
     # rheology
     "rheo_btn": ("Reologia", "Rheology"),
-    "rheo_empty_title": ("Importe um arquivo .txt ou Excel para calcular a curva reológica",
-                         "Import a .txt or Excel file to calculate the rheological curve"),
-    "rheo_empty_hint": ("X = taxa de cisalhamento, Y = tensão de cisalhamento.\n"
-                        "Os modelos são ajustados sozinhos e o melhor é indicado.",
-                        "X = shear rate, Y = shear stress.\n"
-                        "The models are fitted automatically and the best one is indicated."),
     "rheo_col_x": ("Coluna X", "X column"),
     "rheo_col_y": ("Coluna Y", "Y column"),
     "rheo_log": ("Escala logarítmica", "Logarithmic scale"),

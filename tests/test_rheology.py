@@ -44,6 +44,16 @@ def test_results_sorted_and_parameters_not_negative():
     assert all(v >= 0 for f in fits for v in f.params)
 
 
+@pytest.mark.parametrize("scale", [1e-8, 1e-6, 1e3, 1e8])
+def test_unit_of_the_stress_does_not_change_the_fit(scale):
+    y = _curve("hb", CASES["hb"], noise=0.01)
+    for a, b in zip(rh.fit_all(X, y), rh.fit_all(X, y * scale)):
+        assert a.model.key == b.model.key
+        back = [1 if s == "n" else scale for s in a.model.symbols]
+        assert np.divide(b.params, back) == pytest.approx(a.params, rel=1e-4, abs=1e-6)
+        assert b.r2 == pytest.approx(a.r2, abs=1e-9)
+
+
 def test_every_model_has_a_name():
     assert {"rheo_m_" + m.key for m in rh.MODELS} <= set(i18n.STRINGS)
 

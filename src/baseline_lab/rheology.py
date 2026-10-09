@@ -122,14 +122,20 @@ def fit_model(model: Model, x, y) -> Fit | None:
     n, k = len(x), len(model.symbols) + 1  # + 1: the variance of the residuals
     if n - k - 1 <= 0:  # too few points for this number of parameters
         return None
+    # fitted on the stress divided by its largest value: the optimizer stops on an absolute
+    # gradient, so very small stresses (another unit) would end before reaching the minimum.
+    # Every parameter but the exponent n is proportional to the stress
+    scale = float(np.abs(y).max()) or 1.0
+    back = np.array([1.0 if s == "n" else scale for s in model.symbols])
     best, best_sse = None, np.inf
-    for p0 in model.guesses(x, y):
+    for p0 in model.guesses(x, y / scale):
         p0 = np.clip(p0, 1e-9, [min(u, 1e300) for u in model.upper])
         try:
-            p, _ = curve_fit(model.func, x, y, p0=p0, bounds=(0, model.upper),
+            p, _ = curve_fit(model.func, x, y / scale, p0=p0, bounds=(0, model.upper),
                              x_scale="jac", max_nfev=5000)
         except (RuntimeError, ValueError):  # did not converge from this start
             continue
+        p = p * back
         sse = float(np.sum((y - model.func(x, *p)) ** 2))
         if np.isfinite(sse) and sse < best_sse:
             best, best_sse = p, sse
