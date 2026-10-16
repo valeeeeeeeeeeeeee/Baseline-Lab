@@ -45,7 +45,7 @@ jobs:
       # or ssl / _ssl (the update check reads GitHub over HTTPS).
       - name: Build executable
         run: >
-          pyinstaller --noconsole --onefile --name "Baseline Lab"
+          pyinstaller --noconsole --onedir --name "Baseline Lab"
           --icon src/baseline_lab/icon.ico
           --add-data "src/baseline_lab/icon.ico;baseline_lab"
           --exclude-module PIL._avif --exclude-module PIL._webp
@@ -58,10 +58,15 @@ jobs:
       - name: Smoke test (the exe must start and stay open)
         shell: pwsh
         run: |
-          $p = Start-Process -FilePath "dist\Baseline Lab.exe" -PassThru
+          $p = Start-Process -FilePath "dist\Baseline Lab\Baseline Lab.exe" -PassThru
           Start-Sleep -Seconds 15
           if ($p.HasExited) { throw "Baseline Lab.exe exited early with code $($p.ExitCode)" }
           Stop-Process -Id $p.Id -Force
+
+      # A one-dir build is a folder (the exe and its _internal), so the release carries it zipped.
+      - name: Zip the app folder
+        shell: pwsh
+        run: Compress-Archive -Path "dist\Baseline Lab" -DestinationPath "dist\Baseline Lab.zip"
 
       - name: Publish release
         shell: pwsh
@@ -69,6 +74,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "${{ github.ref_name }}" `
-            "dist\Baseline Lab.exe" `
+            "dist\Baseline Lab.zip" `
             --title "Baseline Lab ${{ github.ref_name }}" `
             --generate-notes
