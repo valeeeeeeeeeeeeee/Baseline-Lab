@@ -36,6 +36,7 @@ COLORS = {
     "icon_off": ("#c4c4c4", "#4d4d4d"),
     "stripe": ("#ececec", "#282828"),       # every other block of a log
     "rule": ("black", "#4a4a4a"),           # line under a block of a log
+    "link": ("#0a5fc4", "#6ab0ff"),         # a text that opens a page
 }
 
 # the dark theme's colors of what the system paints in the light one

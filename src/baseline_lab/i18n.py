@@ -87,7 +87,24 @@ STRINGS: dict[str, tuple[str, str]] = {
     "file_save": ("Salvar", "Save"),
     "update_new": ("Nova versão {v} disponível", "New version {v} available"),
     "update_get": ("Baixar", "Download"),
-    "update_hide": ("Dispensar", "Dismiss"),
+    "update_button": ("Nova atualização", "New update"),
+    "update_title": ("Atualização", "Update"),
+    "update_current": ("Você está na versão {v}.", "You have version {v}."),
+    "update_now": ("Atualizar agora", "Update now"),
+    "update_on_exit": ("Atualizar quando sair do app", "Update when leaving the app"),
+    "update_later": ("Depois", "Later"),
+    "update_changelog": ("Ver changelog", "View changelog"),
+    "update_downloading": ("Baixando… {p}%", "Downloading… {p}%"),
+    "update_pending": ("A atualização será instalada quando você sair do app.",
+                       "The update will be installed when you leave the app."),
+    "update_pending_short": ("Atualiza ao sair", "Updates on exit"),
+    "update_cancel": ("Cancelar atualização", "Cancel update"),
+    "update_now_ask": ("O Baseline Lab vai fechar e abrir de novo na versão {v}. "
+                       "Os gráficos abertos serão fechados. Continuar?",
+                       "Baseline Lab will close and open again in version {v}. "
+                       "The open plots will be closed. Continue?"),
+    "update_manual": ("Baixe a nova versão na página da release.",
+                      "Download the new version from the release page."),
     "board_hint": ("Clique em Baseline ou Reologia, na barra acima, para abrir um gráfico.\n"
                    "Selecione um gráfico para usar os ajustes e as ferramentas nele.",
                    "Click Baseline or Rheology, on the bar above, to open a plot.\n"

@@ -21,6 +21,7 @@ import numpy as np
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.figure import Figure
 
+from . import __version__
 from . import baselines as bl
 from . import i18n
 from . import peaks as pk
@@ -279,7 +280,11 @@ class Program:
         self._curve = None                  # (x, baseline) drawn, to find anchors
         self._corr = None                   # (x, corrected) drawn, to mark peaks
         self._hl: list = []                 # artists of the red marking of the selected peak
-        self._update = None                 # (version, page) of a newer release, once found
+        self._update = None                 # the newer release (`updates.Release`), once found
+        self._upd_job = None                # its download: mode, progress, result, error, thread
+        self._upd_win = None                # the window of the update, while open
+        self._upd_btn = self._upd_line = self._upd_row = None
+        self._upd_reopen = False            # that window comes back after a rebuild
         self._mark_imgs = []                # pictures of the sliders' marks
         self._rebuilding = False            # the interface is being made again (`_rebuild`)
         # "Back" / "Forward": the states left behind, the ones gone back from and the one in
@@ -601,9 +606,11 @@ class Program:
     # ------------------------------------------------------------ updates
     def _check_update(self):
         """Looks for a newer release without holding the window: the request runs on a thread
-        and the window picks its answer up (Tk must not be called from another thread)."""
+        and the window picks its answer up (Tk must not be called from another thread). The
+        window of the update opens by itself when there is one."""
         found = []
-        worker = threading.Thread(target=lambda: found.append(updates.check()), daemon=True)
+        worker = threading.Thread(
+            target=lambda: (updates.clean(), found.append(updates.check())), daemon=True)
         worker.start()
 
         def poll():
@@ -612,26 +619,185 @@ class Program:
             elif found and found[0]:
                 self._update = found[0]
                 self._show_update()
+                self.open_update()
         self.after(300, poll)
 
     def _show_update(self):
-        """Notice at the right end of the top bar: the newer release, the button that opens its
-        download page and one that puts the notice away."""
-        version, page = self._update
-        box = ttk.Frame(self._bar)
-        box.pack(side="right")
+        """"New update" at the right end of the top bar: it opens the window of the update
+        again, after it was closed to update later."""
+        self._upd_btn = ttk.Button(self._bar, style="Small.TButton", takefocus=False,
+                                   command=self.open_update)
+        self._upd_btn.pack(side="right")
+        self._update_texts()
+        if self._upd_reopen:  # it was open before a rebuild
+            self._upd_reopen = False
+            self.after_idle(self.open_update)
 
-        def dismiss():
-            self._update = None
-            box.destroy()
+    def _update_texts(self):
+        """The texts that follow the download: the button's and the window's line of state."""
+        job = self._upd_job
+        if not updates.can_install(self._update):
+            short, line = "", tr("update_manual")
+        elif job is None:
+            short = line = ""
+        elif job["result"]:
+            short, line = tr("update_pending_short"), tr("update_pending")
+        else:
+            short = line = tr("update_downloading", p=int(job["progress"] * 100))
+            if job["mode"] == "exit":
+                line += "\n" + tr("update_pending")
+        if self._upd_btn is not None and self._upd_btn.winfo_exists():
+            self._upd_btn.config(text=short or tr("update_button"))
+        if self._upd_win is not None:  # the line takes room only with something to say
+            self._upd_line.config(text=line)
+            if line:
+                self._upd_line.pack(anchor="w", pady=(8, 0), before=self._upd_row)
+            else:
+                self._upd_line.pack_forget()
 
-        ttk.Label(box, text=tr("update_new", v=version), font=("Segoe UI", 8)).pack(side="left")
-        ttk.Button(box, text=tr("update_get"), style="Small.TButton", takefocus=False,
-                   command=lambda: webbrowser.open(page)).pack(side="left", padx=(6, 0))
-        hide = ttk.Button(box, text="×", style="Small.Toolbutton", takefocus=False,
-                          command=dismiss)
-        hide.pack(side="left")
-        Tooltip(hide, tr("update_hide"), small=True)
+    def open_update(self):
+        """Window of the update: the new version, "Update now", "Update when leaving the app"
+        and the changelog (the release's page). A copy that cannot update itself (run from the
+        source, or a release without the zip) offers the release's page instead."""
+        if self._upd_win is not None:
+            self._upd_win.deiconify()
+            self._upd_win.lift()
+            return
+        release = self._update
+        self._upd_win = win = tk.Toplevel(self)
+        win.withdraw()
+        win.title(tr("update_title"))
+        set_icon(win)
+        win.transient(self)
+        win.resizable(False, False)
+
+        def close():
+            self._upd_win = None
+            win.destroy()
+
+        def lost(event):  # destroyed by a rebuild of the interface: it comes back after it
+            if event.widget is win and self._upd_win is win:
+                self._upd_win = None
+                self._upd_reopen = True
+        win.protocol("WM_DELETE_WINDOW", close)
+        win.bind("<Destroy>", lost)
+        body = ttk.Frame(win, padding=(18, 14, 18, 12))
+        body.pack(fill="both", expand=True)
+        ttk.Label(body, text=tr("update_new", v=release.version),
+                  font=("Segoe UI", 11, "bold")).pack(anchor="w")
+        ttk.Label(body, text=tr("update_current", v=__version__),
+                  foreground=theme.color("dim")).pack(anchor="w", pady=(2, 0))
+        self._upd_line = ttk.Label(body, justify="left", wraplength=380)
+        self._upd_row = row = ttk.Frame(body)
+        row.pack(anchor="w", pady=(10, 0))
+        job = self._upd_job
+        if not updates.can_install(release):
+            ttk.Button(row, text=tr("update_get"),
+                       command=lambda: (webbrowser.open(release.page), close())).pack(side="left")
+        else:
+            now = ttk.Button(row, text=tr("update_now"),
+                             command=lambda: self._start_update("now"))
+            now.pack(side="left")
+            if job and job["result"]:  # ready, to be installed on leaving
+                ttk.Button(row, text=tr("update_cancel"),
+                           command=self._cancel_update).pack(side="left", padx=(6, 0))
+            else:
+                later = ttk.Button(row, text=tr("update_on_exit"),
+                                   command=lambda: self._start_update("exit"))
+                later.pack(side="left", padx=(6, 0))
+                if job:  # downloading: "now" may still hurry it
+                    later.state(["disabled"])
+                    if job["mode"] == "now":
+                        now.state(["disabled"])
+        ttk.Button(row, text=tr("update_later"), command=close).pack(side="left", padx=(6, 0))
+        link = ttk.Label(body, text=tr("update_changelog"), cursor="hand2",
+                         foreground=theme.color("link"), font=("Segoe UI", 9, "underline"))
+        link.pack(anchor="w", pady=(10, 0))
+        link.bind("<Button-1>", lambda _e: webbrowser.open(release.page))
+        self._update_texts()
+        # over the middle of the main window
+        win.update_idletasks()
+        x = self.winfo_rootx() + (self.winfo_width() - win.winfo_reqwidth()) // 2
+        y = self.winfo_rooty() + (self.winfo_height() - win.winfo_reqheight()) // 3
+        win.geometry(f"+{max(0, x)}+{max(0, y)}")
+        win.deiconify()
+        title_bar(win)
+
+    def _refill_update(self):
+        """The window of the update made again, for a new state of the download."""
+        if self._upd_win is not None:
+            win, self._upd_win = self._upd_win, None
+            win.destroy()
+            self.open_update()
+        self._update_texts()
+
+    def _start_update(self, mode: str):
+        """"now": downloads the release and closes, to open again in it; "exit": downloads it
+        and installs it when the app is closed. A failure opens the release's page."""
+        release = self._update
+        if mode == "now" and self._charts and not messagebox.askyesno(
+                tr("update_title"), tr("update_now_ask", v=release.version),
+                parent=self._upd_win or self):
+            return
+        job = self._upd_job
+        if job:  # already downloading or downloaded: only the moment changes
+            job["mode"] = mode
+            if job["result"] and mode == "now":
+                self.destroy()  # `after_close` installs it
+            else:
+                self._refill_update()
+            return
+        self._upd_job = job = {"mode": mode, "progress": 0.0, "result": None, "error": None}
+
+        def work():
+            try:
+                job["result"] = updates.download(
+                    release, progress=lambda f: job.__setitem__("progress", f))
+            except Exception as e:  # noqa: BLE001
+                job["error"] = e
+        job["thread"] = worker = threading.Thread(target=work, daemon=True)
+        worker.start()
+
+        def poll():
+            if self._upd_job is not job:
+                return
+            if worker.is_alive():
+                self._update_texts()
+                self.after(200, poll)
+            elif job["error"]:  # a folder where only an administrator writes, among others
+                self._upd_job = None
+                self._refill_update()
+                webbrowser.open(release.page)
+            elif job["mode"] == "now":
+                self.destroy()  # `after_close` installs it
+            else:
+                self._refill_update()
+        self._refill_update()
+        self.after(200, poll)
+
+    def _cancel_update(self):
+        job, self._upd_job = self._upd_job, None
+        if job and job["result"]:
+            updates.discard(job["result"][0])
+        self._refill_update()
+
+    def after_close(self):
+        """Once the window is gone: the download chosen is installed, the app opening again in
+        it when it was "now". One still going on is waited for: it was asked for."""
+        job = self._upd_job
+        if job is None:
+            return
+        job["thread"].join()
+        page = self._update.page
+        if job["result"] is None:
+            webbrowser.open(page)
+            return
+        stage, new = job["result"]
+        try:
+            updates.swap(stage, new, page, restart=job["mode"] == "now")
+        except OSError:
+            updates.discard(stage)
+            webbrowser.open(page)
 
     def _tool_window(self, name: str, state: dict | None, view: str | None = None,
                      title: str | None = None, on_close=None) -> ToolWindow:
@@ -2605,3 +2771,4 @@ def main(argv: list[str] | None = None):
     else:
         app.after_idle(pyi_splash.close)  # once the window is drawn
     app.mainloop()
+    app.after_close()
