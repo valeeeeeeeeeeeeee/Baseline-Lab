@@ -2597,4 +2597,11 @@ def main(argv: list[str] | None = None):
     if sys.platform == "win32":  # own taskbar identity: without it, run from Python, the
         import ctypes            # taskbar shows the interpreter's icon
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("BaselineLab")
-    App(files).mainloop()
+    app = App(files)
+    try:
+        import pyi_splash  # only in the exe: the splash screen shown while it loads
+    except ImportError:
+        pass
+    else:
+        app.after_idle(pyi_splash.close)  # once the window is drawn
+    app.mainloop()

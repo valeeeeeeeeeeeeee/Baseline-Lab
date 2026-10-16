@@ -40,6 +40,28 @@ jobs:
       - name: Run tests
         run: python -m pytest -q
 
+      # The splash screen, shown while the exe loads: a small logo with the name under it, in
+      # Consolas, on a white rectangle. Drawn here from the icon because git ignores *.png.
+      - name: Draw the splash picture
+        shell: python
+        run: |
+          import os
+          from PIL import Image, ImageDraw, ImageFont
+          os.makedirs("build", exist_ok=True)
+          width, height = 480, 300
+          splash = Image.new("RGB", (width, height), "white")
+          draw = ImageDraw.Draw(splash)
+          draw.rectangle((0, 0, width - 1, height - 1), outline="#c8c8c8")
+          logo = Image.open("src/baseline_lab/icon.ico").convert("RGBA")  # its largest size
+          logo = logo.resize((112, 112), Image.LANCZOS)
+          font = ImageFont.truetype("consola.ttf", 30)
+          gap = 18
+          top = (height - logo.height - gap - font.getbbox("baseline lab.")[3]) // 2
+          splash.paste(logo, ((width - logo.width) // 2, top), logo)
+          draw.text((width // 2, top + logo.height + gap), "baseline lab.", font=font,
+                    fill="black", anchor="mt")
+          splash.save("build/splash.png")
+
       # The excluded modules are not used by the app and only make the exe bigger. Do not add
       # _pyrepl (scipy imports pydoc, which needs it), mpl_toolkits (matplotlib warns without it)
       # or ssl / _ssl (the update check reads GitHub over HTTPS).
@@ -48,6 +70,7 @@ jobs:
           pyinstaller --noconsole --onedir --name "Baseline Lab"
           --icon src/baseline_lab/icon.ico
           --add-data "src/baseline_lab/icon.ico;baseline_lab"
+          --splash build/splash.png
           --exclude-module PIL._avif --exclude-module PIL._webp
           --exclude-module _hashlib
           --exclude-module pygments --exclude-module setuptools --exclude-module pkg_resources
