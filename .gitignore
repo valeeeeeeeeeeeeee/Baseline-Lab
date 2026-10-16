@@ -6,3 +6,4 @@ dist/
 *.spec
 *.png
 examples/
+CLAUDE.md
