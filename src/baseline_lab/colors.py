@@ -91,6 +91,15 @@ def checker(w: int, h: int, light, dark, cell: int = 5) -> np.ndarray:
     return np.where(((x // cell + y // cell) % 2)[..., None], dark, light).astype(float)
 
 
+def rounded(r: int) -> np.ndarray:
+    """How much of each pixel a square of rounded corners of radius `r` covers, 0 to 1:
+    (2r + 1, 2r + 1), so that its middle row and column are the ones stretched."""
+    n = 2 * r + 1
+    y, x = np.mgrid[:n, :n] + 0.5
+    d = np.hypot(x - np.clip(x, r, n - r), y - np.clip(y, r, n - r))
+    return np.clip(r - d + 0.5, 0, 1)
+
+
 def over(back: np.ndarray, rgb, alpha) -> np.ndarray:
     """The color `rgb` (0 to 1), `alpha` (0 to 1) opaque, over the picture `back`: as bytes."""
     alpha = np.asarray(alpha, float)[..., None]
