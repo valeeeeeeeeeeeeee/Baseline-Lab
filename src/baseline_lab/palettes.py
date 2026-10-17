@@ -648,8 +648,8 @@ class GridWindow(ToolWindow):
         for name, cell in self._cells.items():
             on = name == app._grid
             cell.configure(background=paper, highlightthickness=2,
-                           highlightbackground=theme.color("chart_edge_on" if on else "outline"),
-                           highlightcolor=theme.color("chart_edge_on" if on else "outline"))
+                           highlightbackground=theme.color("select" if on else "header"),
+                           highlightcolor=theme.color("select" if on else "header"))
             cell.delete("all")
             step = GRIDS[name] / self.SHRINK
             if not step:

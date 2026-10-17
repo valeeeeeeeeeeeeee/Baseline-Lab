@@ -651,7 +651,9 @@ class ChartWindow(tk.Frame):
     PICK = "ChartPick"  # binding tag of the widgets whose clicks select their window
 
     def __init__(self, board, title: str, on_select, on_close):
-        super().__init__(board, background="white", highlightthickness=self.EDGE)
+        # the gray of the top bar around the plot, which stays on white
+        back = ttk.Style(board).lookup(".", "background")
+        super().__init__(board, background=back, highlightthickness=self.EDGE)
         self._on_select = on_select
         self.selected = False
         self.box = (0, 0, *self.MIN_SIZE)  # (x, y, width, height) on the board, at 100% zoom
@@ -665,7 +667,7 @@ class ChartWindow(tk.Frame):
         self._head.set_title(title)
         self._head.place(x=0, y=0, relwidth=1, height=self.HEADER)
         self._head.bind("<Button-1>", self._head_press, add="+")
-        self.body = tk.Frame(self, background="white")
+        self.body = tk.Frame(self, background=back)
         self.body.place(x=self.RIM, y=self.HEADER, relwidth=1, relheight=1, width=-2 * self.RIM,
                         height=-(self.HEADER + self.RIM))
         # only its bare rim sends events to the frame itself
@@ -678,10 +680,11 @@ class ChartWindow(tk.Frame):
 
     def set_selected(self, on: bool):
         self.selected = on
-        mark = "_on" if on else ""
-        edge = theme.color(f"chart_edge{mark}")
+        # the gray of the top bar, or the dark one of what is selected
+        edge = theme.color("select") if on else ttk.Style(self).lookup(".", "background")
         self.configure(highlightbackground=edge, highlightcolor=edge)
-        self._head.configure(background=theme.color(f"header{mark}"))
+        self._head.configure(background=edge)
+        self._head.itemconfigure("ink", fill=theme.color("select_text" if on else "ink"))
 
     def watch(self, canvas: PlotCanvas):
         """`canvas` is the plot inside `body`: it follows the zoom of the board, and the
