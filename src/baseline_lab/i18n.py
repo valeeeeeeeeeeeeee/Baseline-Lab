@@ -114,8 +114,6 @@ STRINGS: dict[str, tuple[str, str]] = {
     "tools": ("Ferramentas", "Tools"),
     "go_back": ("Voltar: desfaz a última alteração", "Back: undo the last change"),
     "go_forward": ("Avançar: refaz a alteração desfeita", "Forward: redo the undone change"),
-    "back_btn": ("Voltar", "Back"),
-    "forward_btn": ("Avançar", "Forward"),
     "notes_btn": ("Notas", "Notes"),
     "analyses": ("Análises", "Analyses"),
     "tool_calc": ("Cálculo", "Calculations"),

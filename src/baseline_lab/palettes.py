@@ -87,9 +87,9 @@ class Palette(ToolWindow):
     def _build_calcs(self):
         self.clear_btn = ttk.Button(self.body, style="Small.Toolbutton", takefocus=False,
                                     command=self._clear)
-        self.clear_btn.pack(anchor="e", padx=6, pady=(4, 0))
+        self.clear_btn.pack(anchor="e", pady=(1, 0))
         box, self.log, _sb = log_box(self.body)
-        box.pack(fill="both", expand=True, padx=6, pady=(2, 6))
+        box.pack(fill="both", expand=True, pady=(1, 0))
         self.log.bind("<Button-3>", self._calc_menu)
         self._blocks: list[list[tuple[str, tuple]]] = []
 
@@ -151,7 +151,7 @@ class Palette(ToolWindow):
 
     def _build_files(self):
         box = ttk.Frame(self.body)
-        box.pack(fill="both", expand=True, padx=6, pady=6)
+        box.pack(fill="both", expand=True)
         self.list = tk.Listbox(box, exportselection=False, activestyle="none", relief="solid",
                                borderwidth=1, highlightthickness=0)
         sb = ttk.Scrollbar(box, orient="vertical", command=self.list.yview)
@@ -362,7 +362,7 @@ class CalcWindow(ToolWindow):
         self.owner, self.entry = owner, entry
         self.of_view = "tga"  # only on screen while a TGA plot is the selected one
         box, self.log, _sb = log_box(self.body)
-        box.pack(fill="both", expand=True, padx=6, pady=6)
+        box.pack(fill="both", expand=True)
         self.log.bind("<Button-3>", self._menu)
         self.retranslate()
         # at the right edge of the board, each new one a little lower than the ones still open
@@ -648,8 +648,8 @@ class GridWindow(ToolWindow):
         for name, cell in self._cells.items():
             on = name == app._grid
             cell.configure(background=paper, highlightthickness=2,
-                           highlightbackground=theme.color("chart_edge_on" if on else "outline"),
-                           highlightcolor=theme.color("chart_edge_on" if on else "outline"))
+                           highlightbackground=theme.color("select" if on else "header"),
+                           highlightcolor=theme.color("select" if on else "header"))
             cell.delete("all")
             step = GRIDS[name] / self.SHRINK
             if not step:

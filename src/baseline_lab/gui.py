@@ -208,7 +208,8 @@ def draw_tool_icon(c: tk.Canvas, kind: str, size: int, x0: float = 0, y0: float 
     its items tagged "icon". Analyses - "tga": a step of mass loss; "rheology": a flow curve
     through measured points. Tools - "baseline": a peak over its baseline; "calcs": a sum
     sign; "peaks": a filled peak; "models": a table; "files": a sheet of paper; "adjust":
-    three sliders; "notes": a letter in a gray outline; "back" / "forward": a curved arrow."""
+    three sliders; "notes": a letter in a gray outline; "back" / "forward": a thick straight
+    arrow."""
     ink, paper = theme.color("ink"), theme.color("paper")
     t = np.linspace(0, 1, 40)
     lo, span = size / 8, size * 3 / 4  # drawing area, in pixels (y grows downwards)
@@ -257,11 +258,10 @@ def draw_tool_icon(c: tk.Canvas, kind: str, size: int, x0: float = 0, y0: float 
                            outline="#909090", width=1, dash=(2, 2))
         c.create_text(size / 2, size / 2 + 1, text="T", fill=ink,
                       font=("Segoe UI", -round(size * 0.55), "bold"))
-    elif kind in ("back", "forward"):  # over the top from one side, down on the other
-        turn = np.linspace(0, np.pi * 1.15, 30)
-        side = 1 if kind == "forward" else -1
-        c.create_line(points(0.42 + 0.38 * np.sin(turn), 0.5 - side * 0.38 * np.cos(turn)),
-                      fill=ink, width=pen, arrow="last", arrowshape=(5, 6, 3))
+    elif kind in ("back", "forward"):  # alone on its button: thick, to be seen without a name
+        ends = [0.08, 0.92] if kind == "forward" else [0.92, 0.08]
+        c.create_line(points([0.5, 0.5], ends), fill=ink, width=3, arrow="last",
+                      arrowshape=(8, 8, 5))
     else:  # "files": a sheet with its corner folded and two lines of text
         sheet = [(0.18, 0), (0.62, 0), (0.84, 0.24), (0.84, 1), (0.18, 1)]
         c.create_polygon(points([1 - y for _x, y in sheet], [x for x, _y in sheet]),
@@ -275,7 +275,7 @@ def draw_tool_icon(c: tk.Canvas, kind: str, size: int, x0: float = 0, y0: float 
 
 
 class TrayButton(tk.Canvas):
-    """A button of the bar of the tools: its icon with its name on the right, on the bar's
+    """A button of the bar of the tools: its icon with its name (if any) on the right, on the bar's
     own background. Under the mouse it takes a patch of the top bar's gray, with rounded
     corners, a darker one while pressed, and the lighter one for good while `marked` (a mode
     that is on). Grayed (not `on`) it shows so, takes no click and lights up for no mouse."""
@@ -288,7 +288,7 @@ class TrayButton(tk.Canvas):
         self._under = self._down = False  # the mouse is over it; pressed on it
         font = tkfont.Font(family="Segoe UI", size=9)
         h = TOOL_SIZE + 2 * self.PAD
-        w = self.PAD + TOOL_SIZE + self.GAP + font.measure(name) + self.PAD + 2
+        w = 2 * self.PAD + TOOL_SIZE + (self.GAP + font.measure(name) + 2 if name else 0)
         back = ttk.Style(parent).lookup("TFrame", "background")
         super().__init__(parent, width=w, height=h, background=back, highlightthickness=0,
                          borderwidth=0, cursor="hand2")
@@ -460,6 +460,11 @@ class Program:
         if f"{element}.border" not in style.element_names():
             r = 4
             cover = colors.rounded(r)
+            # ttk fills the middle by repeating the picture's own middle, one copy at a time:
+            # a middle of one pixel is thousands of copies at each paint of each button, which
+            # made every step of the bar of the tools take half a second. A wide one is a copy
+            cover = cover[np.r_[:r, [r] * 64, r + 1:2 * r + 1]]
+            cover = cover[:, np.r_[:r, [r] * 256, r + 1:2 * r + 1]]
             base = np.ones(cover.shape + (3,)) * np.array(back) / 65535
             pics = [tk.PhotoImage(master=self, data=base64.b64encode(colors.png(
                 colors.over(base, np.array(c) / 65535, cover * on)))) for c, on in
@@ -468,7 +473,7 @@ class Program:
             # "selected": "Analyses" or "Tools" while its icons are out
             style.element_create(f"{element}.border", "image", pics[0], ("pressed", pics[1]),
                                  ("selected", pics[2]), ("active", pics[2]),
-                                 border=r, sticky="nswe")
+                                 border=r, sticky="nswe", width=2 * r + 1, height=2 * r + 1)
         label = ("Toolbutton.label", {"sticky": "nswe"})
         style.layout("Hud.Toolbutton", [(f"{element}.border", {"sticky": "nswe", "children": [
             ("Toolbutton.padding", {"sticky": "nswe", "children": [label]})]})])
@@ -647,7 +652,8 @@ class Program:
         win.of_base = True  # on screen only while the selected plot shows its baseline
         self.adv = ScrollFrame(win.body)
         self.adv.pack(side="right", fill="y")
-        self._corr_box = tk.Frame(win.body, background="white")
+        self._corr_box = tk.Frame(win.body,
+                                  background=ttk.Style(self).lookup(".", "background"))
         self._corr_box.pack(side="left", fill="both", expand=True)
         self._build_advanced(self.adv.inner, ((state or {}).get("file") or {}).get("peak_vals"))
 
@@ -746,12 +752,12 @@ class Program:
         self._tool_icons["files"] = tool_button(sets["analyses"], "files", tr("tool_files"),
                                                 lambda: self.open_tool("files"))
         # first, two arrows: "Back" undoes the last change and "Forward" makes it again.
-        # Grayed while there is nowhere to go
+        # Icons alone, a little apart from the tools. Grayed while there is nowhere to go
         self._hist_btns = [
-            tool_button(sets["tools"], kind, tr(key), command, tr(tip))
-            for kind, key, tip, command in (
-                ("back", "back_btn", "go_back", self.go_back),
-                ("forward", "forward_btn", "go_forward", self.go_forward))]
+            tool_button(sets["tools"], kind, "", command, tr(tip))
+            for kind, tip, command in (("back", "go_back", self.go_back),
+                                       ("forward", "go_forward", self.go_forward))]
+        self._hist_btns[-1].pack_configure(padx=(1, 10))
         self._history_buttons()
         group_line(sets["tools"])
         for kind, key, tip in (("adjust", "tool_adjust", None),
@@ -1507,7 +1513,7 @@ class Program:
         # a click in a floating window moves the focus there by itself, if it takes it
         note, w = self._typed_note(), event.widget
         if (note is not None and isinstance(w, tk.Misc) and w.winfo_toplevel() is self
-                and note not in (w, w.master)):
+                and note not in (w, w.master, getattr(w, "note", None))):
             self.focus_set()
 
     def _sheet_of(self, chart: ChartWindow) -> dict:

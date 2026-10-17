@@ -24,12 +24,13 @@ COLORS = {
     "dim": ("#555", "#a8a8a8"),             # secondary text
     "board": ("white", "#181818"),
     "tab": ("#e4e4e4", "#333333"),          # strip of the sheet tabs and the tabs not open
-    "header": ("#d0d0d0", "#3f3f3f"),       # header of a window, a pressed button; "_on": selected
-    "header_on": ("#bcd4f0", "#2f5d8a"),
+    "header": ("#d0d0d0", "#3f3f3f"),       # header of a window, a pressed button
     "header_hover": ("#b8b8b8", "#5a5a5a"),  # a button of a header under the mouse
     "hover": ("white", "#555555"),          # a button of the top bars or a tab under the mouse
-    "chart_edge": ("#9a9a9a", "#5f5f5f"),   # outline of a plot's window
-    "chart_edge_on": ("#2f7fd6", "#4a9cf0"),
+    # whatever is selected, everywhere: the header and outline of the selected plot, a row of
+    # a list or a table, a marked text, a menu item under the mouse
+    "select": ("#4a4a4a", "#707070"),
+    "select_text": ("white", "white"),
     "outline": ("#707070", "#6a6a6a"),      # outline of a tool window
     "note_edge": ("#a0a0a0", "#6a6a6a"),    # outline of a note on the board, while shown
     "shadow": ("#bdbdbd", "#000000"),       # the edge of the shadow the bar of the tools casts
@@ -43,22 +44,23 @@ COLORS = {
 # the dark theme's colors of what the system paints in the light one
 DARK = {
     "bg": "#2b2b2b", "text": "#e0e0e0", "field": "#1e1e1e", "off": "#7a7a7a",
-    "select": "#2f5d8a", "select_text": "#ffffff",
     "button": "#3c3c3c", "hover": "#4a4a4a", "edge": "#555555", "line": "#000000",
 }
 _line: tk.PhotoImage | None = None  # one dot of "line": the picture of a dark separator
 
 # what a classic widget that does not say its colors takes in the dark theme:
-# {class: {option, as the option database names it: role of DARK}}
+# {class: {option, as the option database names it: role of DARK}}. A role of COLORS is
+# taken in the light theme too: the system's selection is blue. Lists and texts are on the
+# windows' gray ("bg") in both themes; only the fields typed in stay on "field"
 _PLAIN = {"background": "bg"}
-_BOX = {"background": "field", "foreground": "text", "selectBackground": "select",
+_BOX = {"background": "bg", "foreground": "text", "selectBackground": "select",
         "selectForeground": "select_text"}
 DEFAULTS = {
     "Toplevel": _PLAIN, "Frame": _PLAIN, "Canvas": _PLAIN,
     "Label": {"background": "bg", "foreground": "text"},
     "Listbox": _BOX,
     "Text": {**_BOX, "insertBackground": "text"},
-    "Entry": {**_BOX, "insertBackground": "text"},
+    "Entry": {**_BOX, "background": "field", "insertBackground": "text"},
     "Menu": {"background": "bg", "foreground": "text", "activeBackground": "select",
              "activeForeground": "select_text", "disabledForeground": "off",
              "selectColor": "text"},
@@ -94,8 +96,13 @@ def color(role: str) -> str:
 
 
 def _default(cls: str, option: str) -> str:
+    role = DEFAULTS[cls][option]
+    if role in COLORS:
+        return color(role)
     if _theme == "dark":
-        return DARK[DEFAULTS[cls][option]]
+        return DARK[role]
+    if role == "bg":  # the system's gray of a window, which a list or a text does not have
+        return _system["Toplevel", "background"]
     return _system[cls, option]
 
 
@@ -121,6 +128,13 @@ def apply(root: tk.Tk) -> None:
         _dark_style(style)
     else:
         style.theme_use(_native)
+        # the system's own controls, with the selection of the program instead of its blue
+        selected, text = color("select"), color("select_text")
+        style.configure(".", selectbackground=selected, selectforeground=text)
+        back = style.lookup(".", "background")
+        style.configure("Treeview", background=back, fieldbackground=back)
+        style.map("Treeview", background=[("selected", selected)],
+                  foreground=[("selected", text)])
 
 
 def repaint(widget: tk.Misc) -> None:
@@ -136,7 +150,7 @@ def repaint(widget: tk.Misc) -> None:
 def _dark_style(style: ttk.Style) -> None:
     """The ttk controls in dark colors. The system's own theme draws them with the system's
     pictures, which take no colors, so the dark theme is built on "clam"."""
-    c = DARK
+    c = {**DARK, "select": color("select"), "select_text": color("select_text")}
     style.theme_use("clam")
     style.configure(".", background=c["bg"], foreground=c["text"], fieldbackground=c["field"],
                     bordercolor=c["edge"], darkcolor=c["bg"], lightcolor=c["bg"],
@@ -168,13 +182,14 @@ def _dark_style(style: ttk.Style) -> None:
               darkcolor=[("focus", c["field"])])
     # a separator is drawn as a bevel, in a darker and a lighter shade of its color: the
     # lighter one shows as a white line on a dark window, whatever the color. A stretched dot
-    # draws a plain line instead
+    # draws a plain line instead (not a single dot: ttk would paint it once per pixel)
     global _line
     if "Line.separator" not in style.element_names():
-        _line = tk.PhotoImage(master=style.master, width=1, height=1)
-        _line.put(c["line"])
-        style.element_create("Line.separator", "image", _line, sticky="nswe")
+        _line = tk.PhotoImage(master=style.master, width=64, height=64)
+        _line.put(c["line"], to=(0, 0, 64, 64))
+        style.element_create("Line.separator", "image", _line, sticky="nswe", width=1,
+                             height=1)
     style.layout("TSeparator", [("Line.separator", {"sticky": "nswe"})])
-    style.configure("Treeview", background=c["field"])
+    style.configure("Treeview", background=c["bg"], fieldbackground=c["bg"])
     style.map("Treeview", background=[("selected", c["select"])],
               foreground=[("selected", c["select_text"])])
