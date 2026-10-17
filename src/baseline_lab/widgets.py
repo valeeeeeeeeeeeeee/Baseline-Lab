@@ -159,11 +159,14 @@ class PlotCanvas(FigureCanvasTkAgg):
 class Header(tk.Canvas):
     """Title bar of a window without the system's one: the title on the left, buttons on the
     right. Dragging it moves `window`. `buttons`: (name, glyph, command) from the right end
-    inwards. `move`: how the window is taken to (x, y); by default, as a top-level window."""
+    inwards. `move`: how the window is taken to (x, y); by default, as a top-level window.
+    `plain`: it has the background of the window's controls, not a color of its own."""
 
-    def __init__(self, window, height: int, buttons, on_double=None, move=None):
+    def __init__(self, window, height: int, buttons, on_double=None, move=None,
+                 plain: bool = False):
         super().__init__(window, height=height, highlightthickness=0, borderwidth=0)
         self._window, self._on_double, self._names = window, on_double, [b[0] for b in buttons]
+        self._plain = plain
         self._move = move or (lambda x, y: window.geometry(f"+{x}+{y}"))
         self._grab = None
         self.create_text(7, height // 2, anchor="w", font=("Segoe UI", 9, "bold"),
@@ -188,7 +191,9 @@ class Header(tk.Canvas):
 
     def paint(self):
         """Takes the colors of the current theme."""
-        self.configure(background=theme.color("header"))
+        background = (ttk.Style(self).lookup(".", "background") if self._plain
+                      else theme.color("header"))
+        self.configure(background=background)
         self.itemconfigure("ink", fill=theme.color("ink"))
 
     def set_title(self, text: str):
@@ -476,7 +481,7 @@ class ToolWindow(tk.Toplevel):
         self.configure(highlightthickness=1)  # thin outline, as a window border
         self._head = Header(self, self.HEADER, [("close", "\u00d7", lambda: self._on_close()),
                                                 ("min", "\u2013", self.toggle_minimize)],
-                            on_double=self.toggle_minimize)
+                            on_double=self.toggle_minimize, plain=True)
         self._head.pack(side="top", fill="x")
         self.body = ttk.Frame(self)
         self._fit_body()
