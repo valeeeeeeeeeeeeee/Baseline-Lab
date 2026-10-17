@@ -7,6 +7,7 @@ All texts come from i18n.tr(); switching the language rebuilds the interface kee
 """
 from __future__ import annotations
 
+import base64
 import copy
 import pickle
 import re
@@ -24,6 +25,7 @@ from matplotlib.figure import Figure
 
 from . import __version__
 from . import baselines as bl
+from . import colors
 from . import i18n
 from . import peaks as pk
 from . import theme
@@ -170,7 +172,7 @@ class ScrollFrame(ttk.Frame):
             self._canvas.yview_scroll(-1 if ev.delta > 0 else 1, "units")
 
 
-TOOL_SIZE = 22  # side of a header icon, in pixels
+TOOL_SIZE = 20  # side of an icon of the bar of the tools, in pixels
 TRAY_MS = 180   # how long the bar of the tools takes to slide out or in
 SWAP_MS = 160   # how long the other icons take to come into the bar from its left
 GRID_TOP = 2    # height of the blank strip over the top of the board's grid, in pixels
@@ -201,17 +203,18 @@ def hover(widget: tk.Widget, role: str = "hover"):
     widget.bind("<Leave>", leave, add="+")
 
 
-def draw_tool_icon(c: tk.Canvas, kind: str, size: int):
-    """Draws a small square header icon on `c`, `size` pixels wide. Analyses - "tga": a step
-    of mass loss; "rheology": a flow curve through measured points. Tools - "baseline": a peak
-    over its baseline; "calcs": a sum sign; "peaks": a filled peak; "models": a table; "files":
-    a sheet of paper; "adjust": three sliders; "notes": a letter in a gray outline."""
-    c.delete("all")
+def draw_tool_icon(c: tk.Canvas, kind: str, size: int, x0: float = 0, y0: float = 0):
+    """Draws a small square icon on `c`, `size` pixels wide, its top left corner at (x0, y0),
+    its items tagged "icon". Analyses - "tga": a step of mass loss; "rheology": a flow curve
+    through measured points. Tools - "baseline": a peak over its baseline; "calcs": a sum
+    sign; "peaks": a filled peak; "models": a table; "files": a sheet of paper; "adjust":
+    three sliders; "notes": a letter in a gray outline; "back" / "forward": a curved arrow."""
     ink, paper = theme.color("ink"), theme.color("paper")
-    c.configure(width=size, height=size)
     t = np.linspace(0, 1, 40)
-    lo, span = size / 6, size * 11 / 15  # drawing area, in pixels (y grows downwards)
-    pen = max(size / 14, 1.3)
+    lo, span = size / 8, size * 3 / 4  # drawing area, in pixels (y grows downwards)
+    # Tk draws lines in whole pixels, without smoothing: one pixel wide is the sharp one
+    pen = 1
+    first = set(c.find_all())
 
     def points(y, x=t):
         return [v for xx, yy in zip(x, y) for v in (lo + xx * span, lo + (1 - yy) * span)]
@@ -226,13 +229,13 @@ def draw_tool_icon(c: tk.Canvas, kind: str, size: int):
         c.create_line(points(base), fill=ink, width=pen)
     elif kind == "rheology":
         c.create_line(points(0.08 + 0.85 * t ** 0.45), fill=ink, width=pen)
-        r = size / 11
+        r = 2
         for x in (0.12, 0.45, 0.85):
             px, py = lo + x * span, lo + (1 - (0.08 + 0.85 * x ** 0.45)) * span
             c.create_oval(px - r, py - r, px + r, py + r, fill="#d62728", outline=ink)
     elif kind == "calcs":
         c.create_text(size / 2 + 1, size / 2 + 1, text="Σ", fill=ink,
-                      font=("Segoe UI", -round(size * 0.72), "bold"))
+                      font=("Segoe UI", -round(size * 0.85), "bold"))
     elif kind == "peaks":
         peak = 0.1 + 0.85 * np.exp(-((t - 0.5) / 0.16) ** 2)
         c.create_polygon(points(peak) + points([0.1, 0.1], [1, 0]), fill="#d62728", outline="")
@@ -244,16 +247,21 @@ def draw_tool_icon(c: tk.Canvas, kind: str, size: int):
                          outline=ink, width=pen)
         c.create_line(points([0.37, 0.37], [0, 1]), fill=ink, width=pen)
     elif kind == "adjust":
-        r = size / 9
+        r = 2.5
         for y, x in ((0.82, 0.3), (0.5, 0.7), (0.18, 0.45)):  # each slider: its track and knob
             c.create_line(points([y, y], [0, 1]), fill=ink, width=pen)
             px, py = lo + x * span, lo + (1 - y) * span
             c.create_oval(px - r, py - r, px + r, py + r, fill="#d62728", outline=ink)
     elif kind == "notes":
-        c.create_rectangle(size * 0.16, size * 0.16, size * 0.84, size * 0.84,
+        c.create_rectangle(round(lo), round(lo), round(lo + span), round(lo + span),
                            outline="#909090", width=1, dash=(2, 2))
         c.create_text(size / 2, size / 2 + 1, text="T", fill=ink,
                       font=("Segoe UI", -round(size * 0.55), "bold"))
+    elif kind in ("back", "forward"):  # over the top from one side, down on the other
+        turn = np.linspace(0, np.pi * 1.15, 30)
+        side = 1 if kind == "forward" else -1
+        c.create_line(points(0.42 + 0.38 * np.sin(turn), 0.5 - side * 0.38 * np.cos(turn)),
+                      fill=ink, width=pen, arrow="last", arrowshape=(5, 6, 3))
     else:  # "files": a sheet with its corner folded and two lines of text
         sheet = [(0.18, 0), (0.62, 0), (0.84, 0.24), (0.84, 1), (0.18, 1)]
         c.create_polygon(points([1 - y for _x, y in sheet], [x for x, _y in sheet]),
@@ -261,6 +269,98 @@ def draw_tool_icon(c: tk.Canvas, kind: str, size: int):
         c.create_line(points([1, 0.76, 0.76], [0.62, 0.62, 0.84]), fill=ink, width=pen)
         for y in (0.5, 0.26):
             c.create_line(points([y, y], [0.32, 0.7]), fill=ink, width=pen)
+    for item in set(c.find_all()) - first:
+        c.addtag_withtag("icon", item)
+        c.move(item, x0, y0)
+
+
+class TrayButton(tk.Canvas):
+    """A button of the bar of the tools: its icon with its name on the right, on the bar's
+    own background. Under the mouse it takes a patch of the top bar's gray, with rounded
+    corners, a darker one while pressed, and the lighter one for good while `marked` (a mode
+    that is on). Grayed (not `on`) it shows so, takes no click and lights up for no mouse."""
+
+    PAD, GAP, RADIUS = 4, 6, 3  # around the icon and the name; between them; of the corners
+
+    def __init__(self, parent, kind: str, name: str, command):
+        self.kind, self.command = kind, command
+        self.on, self.marked = True, False
+        self._under = self._down = False  # the mouse is over it; pressed on it
+        font = tkfont.Font(family="Segoe UI", size=9)
+        h = TOOL_SIZE + 2 * self.PAD
+        w = self.PAD + TOOL_SIZE + self.GAP + font.measure(name) + self.PAD + 2
+        back = ttk.Style(parent).lookup("TFrame", "background")
+        super().__init__(parent, width=w, height=h, background=back, highlightthickness=0,
+                         borderwidth=0, cursor="hand2")
+        # the patches: a square of rounded corners stretched by its middle to the button's
+        # size, over the bar's color (a picture on a canvas has no alpha Tk would blend)
+        r = self.RADIUS
+        cover = colors.rounded(r)
+        cover = cover[np.r_[:r, [r] * (h - 2 * r), r + 1:2 * r + 1]]
+        cover = cover[:, np.r_[:r, [r] * (w - 2 * r), r + 1:2 * r + 1]]
+        base = np.ones(cover.shape + (3,)) * np.array(self.winfo_rgb(back)) / 65535
+        self._patches = {role: tk.PhotoImage(master=self, data=base64.b64encode(colors.png(
+            colors.over(base, np.array(self.winfo_rgb(theme.color(role))) / 65535, cover))))
+            for role in ("hover", "header")}
+        self._patch = self.create_image(0, 0, anchor="nw")
+        self._name = self.create_text(self.PAD + TOOL_SIZE + self.GAP, h / 2, text=name,
+                                      anchor="w", font=font)
+        self.bind("<Enter>", lambda _e: self._mouse(under=True))
+        self.bind("<Leave>", lambda _e: self._mouse(under=False))
+        self.bind("<ButtonPress-1>", lambda _e: self._mouse(down=True))
+        self.bind("<ButtonRelease-1>", self._release)
+        self._draw()
+
+    def set(self, on: bool | None = None, marked: bool | None = None):
+        """Usable or grayed, marked or not; None leaves it as it is."""
+        before = self.on, self.marked
+        self.on = self.on if on is None else on
+        self.marked = self.marked if marked is None else marked
+        if (self.on, self.marked) != before:
+            self._draw()
+
+    def look(self):
+        """What it shows, for a picture of the bar (`Program._tray_look`): None while the
+        mouse lights it up, which lasts only a moment."""
+        if self.on and (self._under or self._down):
+            return None
+        return self.on, self.marked
+
+    def _mouse(self, under: bool | None = None, down: bool | None = None):
+        if under is not None:
+            self._under = under
+        if down is not None:
+            self._down = down and self.on
+        self._paint()
+
+    def _release(self, _e):
+        # a click is a press and a release on it: let go elsewhere, it is not one
+        fire = self._down and self._under and self.on
+        self._mouse(down=False)
+        if fire:
+            self.command()
+
+    def _paint(self):
+        lit = self.on and (self._under or self._down)
+        role = ("header" if lit and self._down and self._under else
+                "hover" if lit or self.marked else None)
+        self.itemconfigure(self._patch, image=self._patches[role] if role else "")
+
+    def _draw(self):
+        self.delete("icon")
+        draw_tool_icon(self, self.kind, TOOL_SIZE, self.PAD, self.PAD)
+        if not self.on:  # its strokes grayed; what is filled with paper stays so
+            paper, off = theme.color("paper"), theme.color("icon_off")
+            for item in self.find_withtag("icon"):
+                for opt in ("fill", "outline"):
+                    try:
+                        if self.itemcget(item, opt) not in ("", paper):
+                            self.itemconfigure(item, **{opt: off})
+                    except tk.TclError:  # lines have no outline
+                        pass
+        self.itemconfigure(self._name, fill=theme.color("ink" if self.on else "icon_off"))
+        self.configure(cursor="hand2" if self.on else "")
+        self._paint()
 
 
 def set_icon(window):
@@ -350,20 +450,32 @@ class Program:
         style.configure("Small.Toolbutton", font=("Segoe UI", 8), padding=(4, 0))  # flat, no outline
         style.configure("Small.TButton", font=("Segoe UI", 8), padding=(6, 0))
         # the flat buttons of the top bar, which turn whitish under the mouse. The system's
-        # theme draws a Toolbutton with its own pictures, which take no background: their
-        # border comes from "default", a plain fill. Elements and layouts are per ttk theme
-        if "Hud.border" not in style.element_names():
-            style.element_create("Hud.border", "from", "default", "border")
-        for name in ("Hud.Toolbutton", "Arrow.Toolbutton"):
-            style.layout(name, [("Hud.border", {"sticky": "nswe", "children": [
-                ("Toolbutton.padding", {"sticky": "nswe", "children": [
-                    ("Toolbutton.label", {"sticky": "nswe"})]})]})])
-            style.configure(name, relief="flat", borderwidth=0)
+        # theme draws a Toolbutton with its own pictures, which take no background: here the
+        # border is a picture of its own: a square of rounded corners, drawn over the bar's
+        # color (opaque, so nothing has to show through), stretched by its middle. Elements
+        # are per ttk theme and can't be made again, so the name carries the colors
+        back, press, lit = (self.winfo_rgb(c) for c in (
+            style.lookup(".", "background"), theme.color("header"), theme.color("hover")))
+        element = "Hud" + "".join(f"{v // 257:02x}" for c in (back, press, lit) for v in c)
+        if f"{element}.border" not in style.element_names():
+            r = 4
+            cover = colors.rounded(r)
+            base = np.ones(cover.shape + (3,)) * np.array(back) / 65535
+            pics = [tk.PhotoImage(master=self, data=base64.b64encode(colors.png(
+                colors.over(base, np.array(c) / 65535, cover * on)))) for c, on in
+                ((back, 0), (press, 1), (lit, 1))]
+            self._mark_imgs.extend(pics)  # kept: Tk does not hold them
             # "selected": "Analyses" or "Tools" while its icons are out
-            style.map(name, background=[("pressed", theme.color("header")),
-                                        ("selected", theme.color("hover")),
-                                        ("active", theme.color("hover"))])
-        style.configure("Hud.Toolbutton", padding=(10, 2))
+            style.element_create(f"{element}.border", "image", pics[0], ("pressed", pics[1]),
+                                 ("selected", pics[2]), ("active", pics[2]),
+                                 border=r, sticky="nswe")
+        label = ("Toolbutton.label", {"sticky": "nswe"})
+        style.layout("Hud.Toolbutton", [(f"{element}.border", {"sticky": "nswe", "children": [
+            ("Toolbutton.padding", {"sticky": "nswe", "children": [label]})]})])
+        style.configure("Hud.Toolbutton", relief="flat", borderwidth=0)
+        # the label paints no background of its own: the picture shows
+        style.map("Hud.Toolbutton", background=[])
+        style.configure("Hud.Toolbutton", padding=(16, 2))
         # table without its own (gray) border: it gets the same black outline as the other boxes
         style.layout("Treeview", [("Treeview.treearea", {"sticky": "nswe"})])
         # sliders of the advanced options: a small mark in place of the theme's thumb. Once
@@ -601,11 +713,11 @@ class Program:
                              command=lambda k=key: self.toggle_tray(k))
             btn.pack(side="left", anchor="n")
             self._tray_btns[key] = btn
-        # the bar of the tools, under the top bar: small square icons in groups set apart by
-        # a line. "Analyses": one per analysis, which opens new plots of it, and the files;
-        # "Tools": the arrows of the history, "Adjustment" with the tools only one analysis
-        # has, and the calculations. It slides out from under the top bar: the icons hang
-        # from its lower edge
+        # the bar of the tools, under the top bar: buttons of an icon and a name, in groups
+        # set apart by a line. "Analyses": one per analysis, which opens new plots of it,
+        # and the files; "Tools": the arrows of the history, "Adjustment" with the tools
+        # only one analysis has, and the calculations. It slides out from under the top
+        # bar: the buttons hang from its lower edge
         self._tray = tray = ttk.Frame(self, height=0)
         self._tray_job = self._swap_job = None
         self._tray_sets = sets = {key: ttk.Frame(tray) for key in ("analyses", "tools")}
@@ -618,50 +730,41 @@ class Program:
         def group_line(tools):
             ttk.Separator(tools, orient="vertical").pack(side="left", fill="y", padx=8)
 
-        def icon_cell(tools, kind: str, name: str, command):
-            # fixed cell: the icon shrinks inside it when pressed, its neighbors do not move
-            cell = ttk.Frame(tools, width=TOOL_SIZE + 2, height=TOOL_SIZE + 2)
-            cell.pack(side="left", padx=2)
-            icon = tk.Canvas(cell, background=theme.color("paper"), cursor="hand2",
-                             highlightthickness=1,
-                             highlightbackground=theme.color("icon_edge"))
-            icon.place(relx=0.5, rely=0.5, anchor="center")
-            icon.bind("<Button-1>", lambda _e: command())
-            draw_tool_icon(icon, kind, TOOL_SIZE)
-            hover(icon, "icon_hover")
-            Tooltip(icon, name, small=True)
-            return icon
+        def tool_button(tools, kind: str, name: str, command, tip: str | None = None):
+            btn = TrayButton(tools, kind, name, command)
+            btn.pack(side="left", padx=1)
+            if tip:  # only where it says more than the name
+                Tooltip(btn, tip, small=True)
+            return btn
 
-        # {tool: its icon}: grayed while the selected plot does not have that tool
+        # {tool: its button}: grayed while the selected plot does not have that tool
         self._tool_icons = {}
         for view, name in views:
-            icon_cell(sets["analyses"], view, tr("add_plot", name=name),
-                      lambda v=view: self.open_files(v))
+            tool_button(sets["analyses"], view, name, lambda v=view: self.open_files(v),
+                        tr("add_plot", name=name))
         group_line(sets["analyses"])
-        self._tool_icons["files"] = icon_cell(sets["analyses"], "files", tr("tool_files"),
-                                              lambda: self.open_tool("files"))
+        self._tool_icons["files"] = tool_button(sets["analyses"], "files", tr("tool_files"),
+                                                lambda: self.open_tool("files"))
         # first, two arrows: "Back" undoes the last change and "Forward" makes it again.
         # Grayed while there is nowhere to go
-        ttk.Style(self).configure("Arrow.Toolbutton", font=("Segoe UI Symbol", 13),
-                                  padding=(3, 0))
-        self._hist_btns = []
-        for key, arrow, command in (("go_back", "↶", self.go_back),
-                                    ("go_forward", "↷", self.go_forward)):
-            btn = ttk.Button(sets["tools"], text=arrow, style="Arrow.Toolbutton",
-                             takefocus=False, command=command)
-            btn.pack(side="left")
-            Tooltip(btn, tr(key), small=True)
-            self._hist_btns.append(btn)
+        self._hist_btns = [
+            tool_button(sets["tools"], kind, tr(key), command, tr(tip))
+            for kind, key, tip, command in (
+                ("back", "back_btn", "go_back", self.go_back),
+                ("forward", "forward_btn", "go_forward", self.go_forward))]
         self._history_buttons()
         group_line(sets["tools"])
-        for kind, key in (("adjust", "tool_adjust"), ("baseline", "tool_baseline"),
-                          ("peaks", "tool_peaks"), ("models", "tool_models"), (None, ""),
-                          ("calcs", "tool_calc"), (None, ""), ("notes", "tool_notes")):
+        for kind, key, tip in (("adjust", "tool_adjust", None),
+                               ("baseline", "tool_baseline", None),
+                               ("peaks", "tool_peaks", None), ("models", "tool_models", None),
+                               (None, "", None), ("calcs", "tool_calc", None),
+                               (None, "", None), ("notes", "notes_btn", "tool_notes")):
             if kind is None:
                 group_line(sets["tools"])
                 continue
-            self._tool_icons[kind] = icon_cell(sets["tools"], kind, tr(key),
-                                               lambda k=kind: self.open_tool(k))
+            self._tool_icons[kind] = tool_button(sets["tools"], kind, tr(key),
+                                                 lambda k=kind: self.open_tool(k),
+                                                 tip and tr(tip))
         # no line under it: a shadow, as if it lay over the board. It is the tray's own lower
         # edge, so it slides along and takes no clicks from the plots
         shadow = tk.Canvas(tray, height=SHADOW, background=theme.color("board"),
@@ -716,21 +819,16 @@ class Program:
             btn.state(["selected" if key == self._tray_open else "!selected"])
 
     def _tray_look(self, key: str):
-        """What the icons of `key` show now (grayed or not, the arrows of the history usable
-        or not): a picture of them taken while they looked otherwise is no longer them. None
-        while the mouse is over one, which changes it for a moment."""
+        """What the buttons of `key` show now (grayed or not, marked or not): a picture of
+        them taken while they looked otherwise is no longer them. None while the mouse
+        lights one up, which changes it for a moment."""
         look = []
-        for w in self._tray_sets[key].winfo_children():
-            if isinstance(w, ttk.Button):  # an arrow of the history
-                if w.instate(["active"]):
+        for btn in self._tray_sets[key].winfo_children():
+            if isinstance(btn, TrayButton):
+                state = btn.look()
+                if state is None:
                     return None
-                look.append(w.instate(["disabled"]))
-            for icon in w.winfo_children():  # the icon in its cell
-                bg = icon.cget("background")
-                if bg == theme.color("icon_hover"):
-                    return None
-                look.append((bg, str(icon.cget("highlightbackground")),
-                             str(icon.cget("cursor"))))
+                look.append(state)
         return look
 
     def _tray_snap(self):
@@ -1102,29 +1200,18 @@ class Program:
             self.canvas2.draw_idle()  # not drawn while it was out of sight
 
     def _fit_tools(self):
-        """The tools follow the selected plot. The icon of a tool it does not have is grayed
-        (in place: no icon of the bar ever moves); with no plot
+        """The tools follow the selected plot. The button of a tool it does not have is grayed
+        (in place: no button of the bar ever moves); with no plot
         selected, all of them. And every floating window (tools, calculations, pictures)
         belongs to the analysis where it was opened: it is put away while the selected plot is
         of the other one and comes back with a plot of its own. The files are the exception
         to both: they list the plots of every analysis, so they are always there. So are the
-        notes, which are about the board; their icon is marked while they are on."""
+        notes, which are about the board; their button is marked while they are on."""
         view = self._selected[0] if self._selected else None
-        for kind, icon in self._tool_icons.items():
-            on = kind in ("files", "notes") or (view is not None
-                                                and TOOL_VIEW.get(kind, view) == view)
-            edge = ("chart_edge_on" if kind == "notes" and self._notes_on else
-                    "icon_edge" if on else "icon_edge_off")
-            draw_tool_icon(icon, kind, TOOL_SIZE)
-            icon.configure(cursor="hand2" if on else "", highlightbackground=theme.color(edge),
-                **({} if on else {"background": theme.color("paper")}))  # grayed under the mouse
-            for item in () if on else icon.find_all():
-                for opt in ("fill", "outline"):
-                    try:
-                        if icon.itemcget(item, opt) not in ("", theme.color("paper")):
-                            icon.itemconfigure(item, **{opt: theme.color("icon_off")})
-                    except tk.TclError:  # lines have no outline
-                        pass
+        for kind, btn in self._tool_icons.items():
+            btn.set(on=kind in ("files", "notes") or (view is not None
+                                                      and TOOL_VIEW.get(kind, view) == view),
+                    marked=kind == "notes" and self._notes_on)
         # while the interface is rebuilt every file goes through the controls: the windows
         # would come and go with each one. They are fitted once, at the end
         for win in () if self._rebuilding else self.winfo_children():
@@ -1811,7 +1898,7 @@ class Program:
 
     def _history_buttons(self):
         for btn, steps in zip(self._hist_btns, (self._hist_back, self._hist_fwd)):
-            btn.configure(state="normal" if steps else "disabled")
+            btn.set(on=bool(steps))
 
     def go_back(self):
         """"Back": undoes the last change."""
