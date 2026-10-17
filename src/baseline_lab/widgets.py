@@ -825,23 +825,33 @@ class Note(tk.Frame):
     """A block of text typed on the board ("Notes" tool). A gray outline goes around it
     while it is being typed or the mouse is over it, and the note is dragged over the board
     by the margin inside that outline; otherwise only the text shows. It is as large as its
-    text. Its place is kept at 100% zoom, like a plot's (`ChartWindow.box`), and its letters
-    grow with the zoom. A note left empty goes away when the typing ends."""
+    text until one of its corners is dragged: then its width is the one given, the text is
+    broken into lines to fit it (its letters keep their size), and its height is the one given
+    or, if the text needs more, the text's, so none of it is ever out of sight. Its place
+    (and size) is kept at 100% zoom, like a plot's (`ChartWindow.box`), and its letters grow
+    with the zoom. A note left empty goes away when the typing ends."""
 
-    RIM = 5    # margin between the text and the outline: what is dragged
-    FONT = 13  # height of the letters at 100%, in pixels
+    RIM = 5      # margin between the text and the outline: what is dragged
+    FONT = 13    # height of the letters at 100%, in pixels
+    CORNER = 12  # how far from a corner the margin resizes the note instead of moving it
 
     def __init__(self, board, x: float, y: float, text: str = "", scale: float = 1.0,
-                 origin: tuple[float, float] = (0.0, 0.0), remove_label: str = ""):
+                 origin: tuple[float, float] = (0.0, 0.0), remove_label: str = "",
+                 size: tuple[float, float] | None = None):
         paper = theme.color("board")
         super().__init__(board, background=paper, highlightthickness=1, cursor="fleur",
                          highlightbackground=paper, highlightcolor=paper)
         self.at = (x, y)  # where it is on the board, at 100% zoom
+        self.size = size  # of its text, at 100% zoom, once a corner was dragged; None: the text's
         self.scale, self.origin = scale, origin
         self._font = tkfont.Font(family="Segoe UI", size=-max(round(self.FONT * scale), 1))
-        self._drag = None  # where a drag started: the pointer and the note, on screen
+        # where a drag started: the pointer, the note on screen and the corner taken (None:
+        # the note is moved)
+        self._drag = None
+        self._wrapped_at = 0  # width of the text when its lines were counted
         self.text = tk.Text(self, font=self._font, borderwidth=0, highlightthickness=0,
-                            wrap="none", undo=True, padx=1, pady=0, cursor="xterm",
+                            wrap="none" if size is None else "word", undo=True, padx=1, pady=0,
+                            cursor="xterm",
                             background=paper, foreground=theme.color("ink"),
                             insertbackground=theme.color("ink"))
         self.text.insert("1.0", text)
@@ -856,9 +866,11 @@ class Note(tk.Frame):
             w.bind("<Enter>", lambda _e: self._outline(), add="+")
             w.bind("<Leave>", lambda _e: self.after_idle(self._outline), add="+")
             w.bind("<Button-3>", self._menu)
+        self.text.bind("<Configure>", self._laid_out)
+        self.bind("<Motion>", self._hover)
         self.bind("<Button-1>", self._drag_start)
         self.bind("<B1-Motion>", self._drag_move)
-        self.bind("<ButtonRelease-1>", lambda _e: setattr(self, "_drag", None))
+        self.bind("<ButtonRelease-1>", self._drag_end)
         self._remove_label = remove_label
         self._fit()
 
@@ -903,19 +915,40 @@ class Note(tk.Frame):
         self.text.edit_modified(False)  # or <<Modified>> comes no more
         self._fit()
 
+    def _least_width(self) -> int:
+        return self._font.measure("MM") + 6
+
     def _fit(self):
-        """As large as its text (and a little room for the insertion cursor), where `at`
-        says at the zoom of the board."""
-        lines = self.content().split("\n")
-        w = max([self._font.measure(line) for line in lines] + [self._font.measure("  ")]) + 6
-        h = len(lines) * self._font.metrics("linespace")
-        self.text.place_configure(width=w, height=h)
+        """As large as its text (and a little room for the insertion cursor), or as `size`
+        says with the height the text needs at least, where `at` says at the zoom of the
+        board."""
+        linespace = self._font.metrics("linespace")
+        if self.size is None:
+            lines = self.content().split("\n")
+            w = max([self._font.measure(line) for line in lines] + [self._font.measure("  ")]) + 6
+            h = len(lines) * linespace
+            self.text.place_configure(width=w, height=h)
+        else:
+            w = max(round(self.size[0] * self.scale), self._least_width())
+            self.text.place_configure(width=w)
+            self.text.update_idletasks()  # the lines are broken at the width the Text has
+            self._wrapped_at = self.text.winfo_width()
+            shown = self.text.tk.call(self.text._w, "count", "-update", "-displaylines",
+                                      "1.0", "end")
+            h = max(round(self.size[1] * self.scale), max(int(shown or 0), 1) * linespace)
+            self.text.place_configure(height=h)
         self.place(x=round(self.at[0] * self.scale + self.origin[0]),
                    y=round(self.at[1] * self.scale + self.origin[1]),
                    width=w + 2 * (self.RIM + 1), height=h + 2 * (self.RIM + 1))
+        self._box = (w + 2 * (self.RIM + 1), h + 2 * (self.RIM + 1))
         # a Text larger than what it shows scrolls when it is typed in: back to the start
         self.text.xview_moveto(0)
         self.text.yview_moveto(0)
+
+    def _laid_out(self, event):
+        # the Text got its width only now (its board was not on screen): its lines again
+        if self.size is not None and event.width != self._wrapped_at:
+            self._fit()
 
     def set_scale(self, scale: float, origin: tuple[float, float]):
         """The zoom of the board changed: the note takes it, letters and all."""
@@ -923,18 +956,50 @@ class Note(tk.Frame):
         self._font.configure(size=-max(round(self.FONT * scale), 1))
         self._fit()
 
-    def _drag_start(self, _event):
-        self._drag = (*self.winfo_pointerxy(), self.winfo_x(), self.winfo_y())
+    def _corner(self, x: int, y: int) -> tuple[str, str] | None:
+        """The corner of the margin at (x, y), as ("w" / "e", "n" / "s"), or None."""
+        w, h, c = self.winfo_width(), self.winfo_height(), self.CORNER
+        if (x < c or x >= w - c) and (y < c or y >= h - c):
+            return ("w" if x < c else "e", "n" if y < c else "s")
+        return None
+
+    def _hover(self, event):
+        if self._drag is None:
+            corner = self._corner(event.x, event.y)
+            self.configure(cursor="fleur" if corner is None else
+                           "size_nw_se" if corner in (("w", "n"), ("e", "s")) else "size_ne_sw")
+
+    def _drag_start(self, event):
+        self._drag = (*self.winfo_pointerxy(), self.winfo_x(), self.winfo_y(),
+                      self.winfo_width(), self.winfo_height(), self._corner(event.x, event.y))
 
     def _drag_move(self, _event):
         if self._drag is None:
             return
-        x0, y0, nx, ny = self._drag
+        x0, y0, nx, ny, nw, nh, corner = self._drag
         px, py = self.winfo_pointerxy()
-        x, y = nx + px - x0, ny + py - y0
+        if corner is None:
+            x, y = nx + px - x0, ny + py - y0
+        else:
+            # the corner across from the one taken stays where it is
+            w = nw - (px - x0) if corner[0] == "w" else nw + px - x0
+            h = nh - (py - y0) if corner[1] == "n" else nh + py - y0
+            edge = 2 * (self.RIM + 1)
+            if self.size is None:
+                self.text.configure(wrap="word")
+            self.size = (max(w - edge, 1) / self.scale, max(h - edge, 1) / self.scale)
+            self._fit()
+            w, h = self._box  # no smaller than the text
+            self.size = ((w - edge) / self.scale, (h - edge) / self.scale)
+            x = nx + nw - w if corner[0] == "w" else nx
+            y = ny + nh - h if corner[1] == "n" else ny
         self.at = ((x - self.origin[0]) / self.scale, (y - self.origin[1]) / self.scale)
         self.place_configure(x=x, y=y)
         self.update_idletasks()
+
+    def _drag_end(self, event):
+        self._drag = None
+        self._hover(event)
 
     def _menu(self, event):
         menu = tk.Menu(self, tearoff=0)

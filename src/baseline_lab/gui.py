@@ -522,8 +522,8 @@ class Program:
         for n, name, zoom, origin in (state or {}).get("sheets", ((1, None, 1.0, (0.0, 0.0)),)):
             self._new_sheet(n, name, zoom, origin)
         for sheet, notes in zip(self._sheets, (state or {}).get("notes", ())):
-            for x, y, text in notes:
-                self._add_note(sheet, x, y, text)
+            for x, y, text, size in notes:
+                self._add_note(sheet, x, y, text, size)
         self.show_sheet((state or {}).get("sheet", 0))
         # {file: its figures and canvases, as `_figure` gives them} of the TGA plots. With none
         # open, what is drawn goes to figures that are never shown
@@ -1463,14 +1463,17 @@ class Program:
         return [w for w in sheet["board"].winfo_children() if isinstance(w, Note)]
 
     def _notes_state(self) -> list[list[tuple]]:
-        """The notes of each sheet, as data: (x, y, text). One still empty is not one yet."""
-        return [[(*note.at, note.content()) for note in self._notes(sheet)
+        """The notes of each sheet, as data: (x, y, text, size). One still empty is not one
+        yet."""
+        return [[(*note.at, note.content(), note.size) for note in self._notes(sheet)
                  if note.content().strip()] for sheet in self._sheets]
 
-    def _add_note(self, sheet: dict, x: float, y: float, text: str = "") -> Note:
-        """A note on the board of `sheet`, at (x, y) at 100% zoom; above its plots."""
+    def _add_note(self, sheet: dict, x: float, y: float, text: str = "",
+                  size: tuple[float, float] | None = None) -> Note:
+        """A note on the board of `sheet`, at (x, y) at 100% zoom (and of that `size`, if
+        one was given to it); above its plots."""
         return Note(sheet["board"], x, y, text, sheet["zoom"], sheet["origin"],
-                    remove_label=tr("note_remove"))
+                    remove_label=tr("note_remove"), size=size)
 
     def _lift_notes(self, sheet: dict):
         """The notes stay above the plots: they are written over them."""
@@ -1959,8 +1962,8 @@ class Program:
             if notes != old:
                 for note in self._notes(sheet):
                     note.destroy()
-                for x, y, text in notes:
-                    self._add_note(sheet, x, y, text)
+                for x, y, text, size in notes:
+                    self._add_note(sheet, x, y, text, size)
         if last:
             self._selected = None  # selected from scratch: its file may have left the controls
             self.select_chart(*last)
