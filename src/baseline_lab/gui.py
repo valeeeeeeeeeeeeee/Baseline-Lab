@@ -1417,7 +1417,7 @@ class Program:
         # a click in a floating window moves the focus there by itself, if it takes it
         note, w = self._typed_note(), event.widget
         if (note is not None and isinstance(w, tk.Misc) and w.winfo_toplevel() is self
-                and note not in (w, w.master)):
+                and note not in (w, w.master, getattr(w, "note", None))):
             self.focus_set()
 
     def _sheet_of(self, chart: ChartWindow) -> dict:

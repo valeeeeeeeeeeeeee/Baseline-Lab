@@ -275,6 +275,28 @@ def _own(window, owner):
         pass
 
 
+def _see_through(widget, key: str | None = None) -> bool:
+    """Windows: makes a child window a layered one, either with the pixels of color `key`
+    left out of it (what is under them shows, and they let the mouse through) or, with no
+    key, almost invisible all over (alpha 1/255) but still taking the mouse. False where the
+    system does not do it."""
+    if sys.platform != "win32":
+        return False
+    try:
+        user32 = ctypes.windll.user32
+        handle = ctypes.c_void_p(widget.winfo_id())
+        user32.GetWindowLongW.restype = ctypes.c_long
+        style = user32.GetWindowLongW(handle, -20)  # GWL_EXSTYLE
+        user32.SetWindowLongW(handle, -20, style | 0x80000)  # WS_EX_LAYERED
+        if key is None:
+            return bool(user32.SetLayeredWindowAttributes(handle, 0, 1, 2))  # LWA_ALPHA
+        r, g, b = (v >> 8 for v in widget.winfo_rgb(key))
+        return bool(user32.SetLayeredWindowAttributes(handle, r | g << 8 | b << 16, 0,
+                                                      1))  # LWA_COLORKEY
+    except (AttributeError, OSError, tk.TclError):
+        return False
+
+
 class _BitmapInfo(ctypes.Structure):
     """BITMAPINFOHEADER, and room for what the system writes after it."""
     _fields_ = [("size", ctypes.c_uint32), ("width", ctypes.c_int32), ("height", ctypes.c_int32),
@@ -826,7 +848,13 @@ class Note(tk.Frame):
     while it is being typed or the mouse is over it, and the note is dragged over the board
     by the margin inside that outline; otherwise only the text shows. It is as large as its
     text. Its place is kept at 100% zoom, like a plot's (`ChartWindow.box`), and its letters
-    grow with the zoom. A note left empty goes away when the typing ends."""
+    grow with the zoom. A note left empty goes away when the typing ends.
+
+    On Windows it has no background: whatever is under it (the grid, a plot) shows around
+    its letters. Its background is a color the system leaves out (`_see_through`), one step
+    from the board's so that the edges of the letters blend as on the board. Those pixels let
+    the mouse through, so a `catch` of the note's size, just under it and invisible, takes
+    the clicks there: on the margin they drag the note, on the text they go to the text."""
 
     RIM = 5    # margin between the text and the outline: what is dragged
     FONT = 13  # height of the letters at 100%, in pixels
@@ -834,12 +862,26 @@ class Note(tk.Frame):
     def __init__(self, board, x: float, y: float, text: str = "", scale: float = 1.0,
                  origin: tuple[float, float] = (0.0, 0.0), remove_label: str = ""):
         paper = theme.color("board")
+        # created first: it is under the note
+        self.catch = tk.Frame(board, background=paper, cursor="fleur")
+        self.catch.note = self
+        if _see_through(self.catch):
+            r, g, b = (v >> 8 for v in board.winfo_rgb(paper))
+            paper = f"#{r:02x}{g:02x}{b - 1 if b else 1:02x}"
+        else:
+            self.catch.destroy()
+            self.catch = None
+        self._paper = paper
         super().__init__(board, background=paper, highlightthickness=1, cursor="fleur",
                          highlightbackground=paper, highlightcolor=paper)
+        if self.catch is not None and not _see_through(self, paper):
+            self.catch.destroy()
+            self.catch = None
         self.at = (x, y)  # where it is on the board, at 100% zoom
         self.scale, self.origin = scale, origin
         self._font = tkfont.Font(family="Segoe UI", size=-max(round(self.FONT * scale), 1))
         self._drag = None  # where a drag started: the pointer and the note, on screen
+        self._typing = False  # a press of the catch on the text: what moves selects
         self.text = tk.Text(self, font=self._font, borderwidth=0, highlightthickness=0,
                             wrap="none", undo=True, padx=1, pady=0, cursor="xterm",
                             background=paper, foreground=theme.color("ink"),
@@ -852,15 +894,64 @@ class Note(tk.Frame):
         self.text.bind("<FocusIn>", lambda _e: self._outline())
         self.text.bind("<FocusOut>", self._focus_out)
         self.text.bind("<Escape>", lambda _e: (self.winfo_toplevel().focus_set(), "break")[1])
-        for w in (self, self.text):
+        for w in (self, self.text, self.catch):
+            if w is None:
+                continue
             w.bind("<Enter>", lambda _e: self._outline(), add="+")
             w.bind("<Leave>", lambda _e: self.after_idle(self._outline), add="+")
             w.bind("<Button-3>", self._menu)
         self.bind("<Button-1>", self._drag_start)
         self.bind("<B1-Motion>", self._drag_move)
         self.bind("<ButtonRelease-1>", lambda _e: setattr(self, "_drag", None))
+        if self.catch is not None:
+            self.catch.bind("<Motion>", self._catch_cursor)
+            self.catch.bind("<Button-1>", self._catch_press)
+            self.catch.bind("<Double-Button-1>", lambda e: self._to_text("<Double-Button-1>", e))
+            self.catch.bind("<B1-Motion>", self._catch_move)
+            self.catch.bind("<ButtonRelease-1>", self._catch_release)
         self._remove_label = remove_label
         self._fit()
+
+    def _on_text(self, event) -> tuple[int, int] | None:
+        """Where an event of the catch falls on the text, or None if on the margin."""
+        x, y = event.x - self.RIM - 1, event.y - self.RIM - 1
+        inside = 0 <= x < self.text.winfo_width() and 0 <= y < self.text.winfo_height()
+        return (x, y) if inside else None
+
+    def _to_text(self, sequence: str, event):
+        """An event of the catch, given to the text as if it had been on it."""
+        x, y = event.x - self.RIM - 1, event.y - self.RIM - 1
+        self.text.event_generate(sequence, x=x, y=y, rootx=event.x_root, rooty=event.y_root)
+        return "break"
+
+    def _catch_cursor(self, event):
+        self.catch.configure(cursor="xterm" if self._on_text(event) else "fleur")
+
+    def _catch_press(self, event):
+        self._typing = self._on_text(event) is not None
+        return self._to_text("<Button-1>", event) if self._typing else self._drag_start(event)
+
+    def _catch_move(self, event):
+        return self._to_text("<B1-Motion>", event) if self._typing else self._drag_move(event)
+
+    def _catch_release(self, event):
+        if self._typing:
+            self._to_text("<ButtonRelease-1>", event)
+        self._typing, self._drag = False, None
+
+    def lift(self, above=None):
+        """To the top of the board, its catch just under it."""
+        if self.catch is not None:
+            self.catch.lift(above)
+            super().lift(self.catch)
+        else:
+            super().lift(above)
+
+    def destroy(self):
+        if self.catch is not None:
+            with contextlib.suppress(tk.TclError, KeyError):  # gone with the board
+                self.catch.destroy()
+        super().destroy()
 
     def content(self) -> str:
         return self.text.get("1.0", "end-1c")
@@ -879,8 +970,9 @@ class Note(tk.Frame):
             under = self.winfo_containing(*self.winfo_pointerxy())
         except (KeyError, tk.TclError):
             under = None
-        on = self.editing() or under in (self, self.text) or self._drag is not None
-        edge = theme.color("note_edge" if on else "board")
+        on = (self.editing() or under in (self, self.text, self.catch)
+              or self._drag is not None)
+        edge = theme.color("note_edge") if on else self._paper
         self.configure(highlightbackground=edge, highlightcolor=edge)
 
     def _focus_out(self, _event):
@@ -910,9 +1002,11 @@ class Note(tk.Frame):
         w = max([self._font.measure(line) for line in lines] + [self._font.measure("  ")]) + 6
         h = len(lines) * self._font.metrics("linespace")
         self.text.place_configure(width=w, height=h)
-        self.place(x=round(self.at[0] * self.scale + self.origin[0]),
-                   y=round(self.at[1] * self.scale + self.origin[1]),
-                   width=w + 2 * (self.RIM + 1), height=h + 2 * (self.RIM + 1))
+        for widget in (self.catch, self):
+            if widget is not None:
+                widget.place(x=round(self.at[0] * self.scale + self.origin[0]),
+                             y=round(self.at[1] * self.scale + self.origin[1]),
+                             width=w + 2 * (self.RIM + 1), height=h + 2 * (self.RIM + 1))
         # a Text larger than what it shows scrolls when it is typed in: back to the start
         self.text.xview_moveto(0)
         self.text.yview_moveto(0)
@@ -933,7 +1027,9 @@ class Note(tk.Frame):
         px, py = self.winfo_pointerxy()
         x, y = nx + px - x0, ny + py - y0
         self.at = ((x - self.origin[0]) / self.scale, (y - self.origin[1]) / self.scale)
-        self.place_configure(x=x, y=y)
+        for widget in (self.catch, self):
+            if widget is not None:
+                widget.place_configure(x=x, y=y)
         self.update_idletasks()
 
     def _menu(self, event):
