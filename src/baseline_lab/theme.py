@@ -22,15 +22,19 @@ COLORS = {
     "ink": ("black", "#e0e0e0"),            # titles of the headers, strokes of the icons
     "paper": ("white", "#1e1e1e"),          # background of the icons, balloons and log blocks
     "dim": ("#555", "#a8a8a8"),             # secondary text
-    "hint": ("#888", "#777777"),            # the hint of an empty board
     "board": ("white", "#181818"),
     "tab": ("#e4e4e4", "#333333"),          # strip of the sheet tabs and the tabs not open
     "header": ("#d0d0d0", "#3f3f3f"),       # header of a window; "_on": of the selected plot
     "header_on": ("#bcd4f0", "#2f5d8a"),
     "header_hover": ("#b8b8b8", "#5a5a5a"),  # a button of a header under the mouse
+    "hover": ("white", "#555555"),          # a button of the top bar or a tab under the mouse
+    "icon_hover": ("#e6eef8", "#3a3a3a"),   # an icon of the top bar under it: "paper" is white
     "chart_edge": ("#9a9a9a", "#5f5f5f"),   # outline of a plot's window
     "chart_edge_on": ("#2f7fd6", "#4a9cf0"),
     "outline": ("#707070", "#6a6a6a"),      # outline of a tool window
+    "note_edge": ("#a0a0a0", "#6a6a6a"),    # outline of a note on the board, while shown
+    "shadow": ("#bdbdbd", "#000000"),       # the edge of the shadow the bar of the tools casts
+    "grid": ("#e2e2e2", "#2c2c2c"),         # lines of the board's grid, if no color was chosen
     "icon_edge": ("#999", "#6a6a6a"),       # an icon of the top bar; "_off": grayed
     "icon_edge_off": ("#ccc", "#3a3a3a"),
     "icon_off": ("#c4c4c4", "#4d4d4d"),

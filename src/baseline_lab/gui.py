@@ -11,6 +11,7 @@ import copy
 import pickle
 import re
 import threading
+import time
 import tkinter as tk
 import webbrowser
 from pathlib import Path
@@ -31,11 +32,11 @@ from .derivative import dtg
 from .i18n import tr
 from .io_txt import DataFile, read_file
 from .rheology_gui import RheologyPanel
-from .palettes import CalcWindow, ColorWindow, Palette, open_palette
+from .palettes import GRIDS, CalcWindow, ColorWindow, GridWindow, Palette, open_palette
 from .scipy_load import scipy_parts
-from .widgets import (CAN_COPY_IMAGE, ChartWindow, Layout, PlotCanvas, ToolWindow, block_at,
-                      ZoomSlider, copy_figure, file_key, file_title, log_box, paint_icon,
-                      render_log, show_image, still, title_bar)
+from .widgets import (CAN_COPY_IMAGE, ChartWindow, Layout, Note, PlotCanvas, ToolWindow,
+                      ZoomSlider, block_at, copy_figure, file_key, file_title, log_box, paint_icon,
+                      render_log, show_image, snapshot, still, title_bar)
 
 COMPARE_COLORS = ["#1f77b4", "#2ca02c", "#9467bd", "#ff7f0e", "#17becf", "#8c564b",
                   "#e377c2", "#7f7f7f", "#bcbd22"]
@@ -170,6 +171,10 @@ class ScrollFrame(ttk.Frame):
 
 
 TOOL_SIZE = 22  # side of a header icon, in pixels
+TRAY_MS = 180   # how long the bar of the tools takes to slide out or in
+SWAP_MS = 160   # how long the other icons take to come into the bar from its left
+GRID_TOP = 2    # height of the blank strip over the top of the board's grid, in pixels
+SHADOW = 6      # height of the shadow the bar of the tools casts on the board, in pixels
 # the tools that only one analysis has; the others are about the selected plot, whatever it is
 TOOL_VIEW = {"baseline": "tga", "peaks": "tga", "models": "rheology"}
 VIEWS = {"tga": "tga", "rheology": "rheo_btn"}  # {analysis: the text of its name}
@@ -177,11 +182,30 @@ HISTORY_MS = 250    # how often the history looks for a change ("Back" / "Forwar
 HISTORY_STEPS = 50  # how many changes it can go back
 
 
+def hover(widget: tk.Widget, role: str = "hover"):
+    """`widget` takes the color `role` while the mouse is over it, if it is clickable then
+    (its cursor is the hand: a grayed icon and the open tab are not). Whatever set another
+    color meanwhile (the tab just opened, no longer a hand) keeps it when the mouse leaves."""
+    before = []
+
+    def enter(_e):
+        if str(widget.cget("cursor")) == "hand2":
+            before[:] = [widget.cget("background")]
+            widget.configure(background=theme.color(role))
+
+    def leave(_e):
+        if before and str(widget.cget("cursor")) == "hand2":
+            widget.configure(background=before[0])
+        before.clear()
+    widget.bind("<Enter>", enter, add="+")
+    widget.bind("<Leave>", leave, add="+")
+
+
 def draw_tool_icon(c: tk.Canvas, kind: str, size: int):
     """Draws a small square header icon on `c`, `size` pixels wide. Analyses - "tga": a step
     of mass loss; "rheology": a flow curve through measured points. Tools - "baseline": a peak
     over its baseline; "calcs": a sum sign; "peaks": a filled peak; "models": a table; "files":
-    a sheet of paper; "adjust": three sliders."""
+    a sheet of paper; "adjust": three sliders; "notes": a letter in a gray outline."""
     c.delete("all")
     ink, paper = theme.color("ink"), theme.color("paper")
     c.configure(width=size, height=size)
@@ -225,6 +249,11 @@ def draw_tool_icon(c: tk.Canvas, kind: str, size: int):
             c.create_line(points([y, y], [0, 1]), fill=ink, width=pen)
             px, py = lo + x * span, lo + (1 - y) * span
             c.create_oval(px - r, py - r, px + r, py + r, fill="#d62728", outline=ink)
+    elif kind == "notes":
+        c.create_rectangle(size * 0.16, size * 0.16, size * 0.84, size * 0.84,
+                           outline="#909090", width=1, dash=(2, 2))
+        c.create_text(size / 2, size / 2 + 1, text="T", fill=ink,
+                      font=("Segoe UI", -round(size * 0.55), "bold"))
     else:  # "files": a sheet with its corner folded and two lines of text
         sheet = [(0.18, 0), (0.62, 0), (0.84, 0.24), (0.84, 1), (0.18, 1)]
         c.create_polygon(points([1 - y for _x, y in sheet], [x for x, _y in sheet]),
@@ -285,6 +314,15 @@ class Program:
         self._upd_win = None                # the window of the update, while open
         self._upd_btn = self._upd_line = self._upd_row = None
         self._upd_reopen = False            # that window comes back after a rebuild
+        self._tray_open = None              # whose icons the bar of the tools shows, if out
+        self._notes_on = False              # "Notes": a click on the board starts a note
+        # the grid of the boards ("View > Background format", `GRIDS`) and the color of its
+        # lines (None: the theme's); the program's, not a file's, so kept as settings
+        self._grid = i18n.load_setting("grid", "none")
+        if self._grid not in GRIDS:
+            self._grid = "none"
+        self._grid_color = i18n.load_setting("grid_color", "") or None
+        self._grid_rule = i18n.load_setting("grid_rule", "") == "1"  # horizontal lines alone
         self._mark_imgs = []                # pictures of the sliders' marks
         self._rebuilding = False            # the interface is being made again (`_rebuild`)
         # "Back" / "Forward": the states left behind, the ones gone back from and the one in
@@ -298,6 +336,10 @@ class Program:
         for cls in ("TCombobox", "TSpinbox"):
             self.unbind_class(cls, "<MouseWheel>")
         self.bind_all("<Control-MouseWheel>", self._board_wheel)
+        # a click outside the note being typed ends the typing, even where the click takes
+        # no keyboard (the board, the header of a plot); Esc leaves "Notes"
+        self.bind_all("<ButtonPress-1>", self._click_away, add="+")
+        self.bind_all("<Escape>", lambda _e: self.toggle_notes(False), add="+")
         self._build_ui()
         self._history_tick()
 
@@ -307,6 +349,21 @@ class Program:
         style.configure("Title.TLabel", font=("Segoe UI", 10, "bold"))
         style.configure("Small.Toolbutton", font=("Segoe UI", 8), padding=(4, 0))  # flat, no outline
         style.configure("Small.TButton", font=("Segoe UI", 8), padding=(6, 0))
+        # the flat buttons of the top bar, which turn whitish under the mouse. The system's
+        # theme draws a Toolbutton with its own pictures, which take no background: their
+        # border comes from "default", a plain fill. Elements and layouts are per ttk theme
+        if "Hud.border" not in style.element_names():
+            style.element_create("Hud.border", "from", "default", "border")
+        for name in ("Hud.Toolbutton", "Arrow.Toolbutton"):
+            style.layout(name, [("Hud.border", {"sticky": "nswe", "children": [
+                ("Toolbutton.padding", {"sticky": "nswe", "children": [
+                    ("Toolbutton.label", {"sticky": "nswe"})]})]})])
+            style.configure(name, relief="flat", borderwidth=0)
+            # "selected": "Analyses" or "Tools" while its icons are out
+            style.map(name, background=[("pressed", theme.color("header")),
+                                        ("selected", theme.color("hover")),
+                                        ("active", theme.color("hover"))])
+        style.configure("Hud.Toolbutton", padding=(10, 2))
         # table without its own (gray) border: it gets the same black outline as the other boxes
         style.layout("Treeview", [("Treeview.treearea", {"sticky": "nswe"})])
         # sliders of the advanced options: a small mark in place of the theme's thumb. Once
@@ -340,17 +397,21 @@ class Program:
                                  font=("Segoe UI", 10, "bold"))
         self._add_tab.pack(side="left")
         self._add_tab.bind("<Button-1>", lambda _e: self.add_sheet())
+        hover(self._add_tab)
         Tooltip(self._add_tab, tr("sheet_new"), small=True)
         # at the right end of the strip: the zoom of the open sheet
         self._zoom = ZoomSlider(self._tabs, self.set_zoom)
         self._zoom.pack(side="right", fill="y")
-        # {"n": its number, "name": the one the user gave it, "zoom", "board", "hint", "tab",
+        # {"n": its number, "name": the one the user gave it, "zoom", "board", "tab",
         # "selected"}
         self._sheets: list[dict] = []
         self.board = None
         self._zoom_at = (0, 0)  # the point of the board that a change of zoom leaves in place
         for n, name, zoom, origin in (state or {}).get("sheets", ((1, None, 1.0, (0.0, 0.0)),)):
             self._new_sheet(n, name, zoom, origin)
+        for sheet, notes in zip(self._sheets, (state or {}).get("notes", ())):
+            for x, y, text in notes:
+                self._add_note(sheet, x, y, text)
         self.show_sheet((state or {}).get("sheet", 0))
         # {file: its figures and canvases, as `_figure` gives them} of the TGA plots. With none
         # open, what is drawn goes to figures that are never shown
@@ -506,33 +567,11 @@ class Program:
         # nothing to save while no plot is selected
         file_menu.configure(postcommand=lambda: file_menu.entryconfigure(
             1, state="normal" if self._shown_plot()[1] else "disabled"))
-        ttk.Menubutton(bar, text=tr("file_btn"), style="Toolbutton", takefocus=False,
+        ttk.Menubutton(bar, text=tr("file_btn"), style="Hud.Toolbutton", takefocus=False,
                        menu=file_menu).pack(side="left", anchor="n")
-        # "Analyses", next to it: each one asks for files and opens them as its plots (same as
-        # the icons)
-        analyses = tk.Menu(self, tearoff=0)
         for view, name in views:
-            for menu in (load, analyses):
-                menu.add_command(label=name, command=lambda v=view: self.open_files(v))
-        ttk.Menubutton(bar, text=tr("analyses"), style="Toolbutton", takefocus=False,
-                       menu=analyses).pack(side="left", anchor="n")
-        # "Tools": each one opens in a small floating window over the board, about the
-        # selected plot
-        self._tools_menu = tools_menu = tk.Menu(self, tearoff=0)
-        for kind, key in (("calcs", "tool_calc"), ("files", "tool_files"),
-                          ("adjust", "tool_adjust")):
-            tools_menu.add_command(label=tr(key), command=lambda k=kind: self.open_tool(k))
-        # the tools that only one analysis has, under its name
-        for view, name in views:
-            own = tk.Menu(tools_menu, tearoff=0)
-            for kind, key in (("baseline", "tool_baseline"), ("peaks", "tool_peaks"),
-                              ("models", "tool_models")):
-                if TOOL_VIEW[kind] == view:
-                    own.add_command(label=tr(key), command=lambda k=kind: self.open_tool(k))
-            tools_menu.add_cascade(label=name, menu=own)
-        ttk.Menubutton(bar, text=tr("tools"), style="Toolbutton", takefocus=False,
-                       menu=tools_menu).pack(side="left", anchor="n")
-        # "Options": opens a menu (the interface language and its theme)
+            load.add_command(label=name, command=lambda v=view: self.open_files(v))
+        # "Options", next to "File": opens a menu (the interface language and its theme)
         options = tk.Menu(self, tearoff=0)
         langs = tk.Menu(options, tearoff=0)
         options.add_cascade(label=tr("language"), menu=langs)
@@ -547,17 +586,39 @@ class Program:
         for name, key in theme.THEMES.items():
             themes.add_radiobutton(label=tr(key), value=name, variable=self._theme_var,
                                    command=lambda n=name: self.after_idle(self.set_theme, n))
-        ttk.Menubutton(bar, text=tr("options_btn"), style="Toolbutton", takefocus=False,
+        ttk.Menubutton(bar, text=tr("options_btn"), style="Hud.Toolbutton", takefocus=False,
                        menu=options).pack(side="left", anchor="n")
-        # middle of the bar, on its own line: small square icons in three groups set apart by a
-        # line. Left: "Adjustment" and the tools only one analysis has; middle: the tools
-        # every plot has; right: one per analysis, which opens new plots of it
-        tools = ttk.Frame(bar)
+        # "View", next to "Options": how the board looks
+        view_menu = tk.Menu(self, tearoff=0)
+        view_menu.add_command(label=tr("grid_title"), command=self.open_grid)
+        ttk.Menubutton(bar, text=tr("view_btn"), style="Hud.Toolbutton", takefocus=False,
+                       menu=view_menu).pack(side="left", anchor="n")
+        # "Tools" and "Analyses", after it: each one brings out (or puts away) the bar of
+        # the tools, under this one, with its own icons
+        self._tray_btns = {}
+        for key in ("tools", "analyses"):
+            btn = ttk.Button(bar, text=tr(key), style="Hud.Toolbutton", takefocus=False,
+                             command=lambda k=key: self.toggle_tray(k))
+            btn.pack(side="left", anchor="n")
+            self._tray_btns[key] = btn
+        # the bar of the tools, under the top bar: small square icons in groups set apart by
+        # a line. "Analyses": one per analysis, which opens new plots of it, and the files;
+        # "Tools": the arrows of the history, "Adjustment" with the tools only one analysis
+        # has, and the calculations. It slides out from under the top bar: the icons hang
+        # from its lower edge
+        self._tray = tray = ttk.Frame(self, height=0)
+        self._tray_job = self._swap_job = None
+        self._tray_sets = sets = {key: ttk.Frame(tray) for key in ("analyses", "tools")}
+        self._tray_shown = None  # whose icons are in the bar (still there while it slides in)
+        # what moves in the bar is a picture of its icons, when there is one of them as they
+        # are: {set: (picture, `_tray_look` then)}. See `_tray_put`
+        self._tray_pics = {}
+        self._tray_pic = tk.Label(tray, borderwidth=0, padx=0, pady=0, highlightthickness=0)
 
-        def group_line():
+        def group_line(tools):
             ttk.Separator(tools, orient="vertical").pack(side="left", fill="y", padx=8)
 
-        def icon_cell(kind: str, name: str, command):
+        def icon_cell(tools, kind: str, name: str, command):
             # fixed cell: the icon shrinks inside it when pressed, its neighbors do not move
             cell = ttk.Frame(tools, width=TOOL_SIZE + 2, height=TOOL_SIZE + 2)
             cell.pack(side="left", padx=2)
@@ -567,41 +628,182 @@ class Program:
             icon.place(relx=0.5, rely=0.5, anchor="center")
             icon.bind("<Button-1>", lambda _e: command())
             draw_tool_icon(icon, kind, TOOL_SIZE)
+            hover(icon, "icon_hover")
             Tooltip(icon, name, small=True)
             return icon
 
-        # before the icons, at the left of "Adjustment", two arrows: "Back" undoes the last
-        # change and "Forward" makes it again. Grayed while there is nowhere to go
+        # {tool: its icon}: grayed while the selected plot does not have that tool
+        self._tool_icons = {}
+        for view, name in views:
+            icon_cell(sets["analyses"], view, tr("add_plot", name=name),
+                      lambda v=view: self.open_files(v))
+        group_line(sets["analyses"])
+        self._tool_icons["files"] = icon_cell(sets["analyses"], "files", tr("tool_files"),
+                                              lambda: self.open_tool("files"))
+        # first, two arrows: "Back" undoes the last change and "Forward" makes it again.
+        # Grayed while there is nowhere to go
         ttk.Style(self).configure("Arrow.Toolbutton", font=("Segoe UI Symbol", 13),
                                   padding=(3, 0))
         self._hist_btns = []
         for key, arrow, command in (("go_back", "↶", self.go_back),
                                     ("go_forward", "↷", self.go_forward)):
-            btn = ttk.Button(tools, text=arrow, style="Arrow.Toolbutton", takefocus=False,
-                             command=command)
+            btn = ttk.Button(sets["tools"], text=arrow, style="Arrow.Toolbutton",
+                             takefocus=False, command=command)
             btn.pack(side="left")
             Tooltip(btn, tr(key), small=True)
             self._hist_btns.append(btn)
         self._history_buttons()
-        group_line()
-        # {tool: its icon}: grayed while the selected plot does not have that tool
-        self._tool_icons = {}
+        group_line(sets["tools"])
         for kind, key in (("adjust", "tool_adjust"), ("baseline", "tool_baseline"),
                           ("peaks", "tool_peaks"), ("models", "tool_models"), (None, ""),
-                          ("calcs", "tool_calc"), ("files", "tool_files")):
+                          ("calcs", "tool_calc"), (None, ""), ("notes", "tool_notes")):
             if kind is None:
-                group_line()
+                group_line(sets["tools"])
                 continue
-            self._tool_icons[kind] = icon_cell(kind, tr(key), lambda k=kind: self.open_tool(k))
-        group_line()
-        for view, name in views:
-            icon_cell(view, tr("add_plot", name=name), lambda v=view: self.open_files(v))
-        tools.place(relx=0.5, rely=0.5, anchor="center")
-        # `place` does not make the bar taller: this strut gives it the height of the tools
-        tools.update_idletasks()  # the requested height only exists after the layout
-        ttk.Frame(bar, width=0, height=tools.winfo_reqheight()).pack(side="left")
+            self._tool_icons[kind] = icon_cell(sets["tools"], kind, tr(key),
+                                               lambda k=kind: self.open_tool(k))
+        # no line under it: a shadow, as if it lay over the board. It is the tray's own lower
+        # edge, so it slides along and takes no clicks from the plots
+        shadow = tk.Canvas(tray, height=SHADOW, background=theme.color("board"),
+                           highlightthickness=0)
+        shadow.place(relx=0, rely=1.0, relwidth=1, anchor="sw")
+        dark, light = (self.winfo_rgb(theme.color(r)) for r in ("shadow", "board"))
+        for y in range(SHADOW):
+            t = (y / SHADOW) ** 0.7  # darkest at the edge, fading fast
+            shade = "#%02x%02x%02x" % tuple(round(d + (l - d) * t) >> 8
+                                            for d, l in zip(dark, light))
+            shadow.create_line(0, y, 10000, y, fill=shade)  # wider than any screen
+        tray.update_idletasks()  # the requested sizes only exist after the layout
+        # `place` does not make the tray taller: its height is set, step by step
+        self._tray_full = max(tools.winfo_reqheight() for tools in sets.values()) + 8 + SHADOW
+        self._tray_marks()
+        if self._tray_open:  # out before a rebuild: out at once
+            self._tray_put(self._tray_open)
+            tray.configure(height=self._tray_full)
+            tray.pack(side="top", fill="x", after=bar)
         if self._update:  # the notice comes back with the bar on a language switch
             self._show_update()
+
+    def toggle_tray(self, key: str):
+        """"Analyses" / "Tools": the bar of the tools slides out with the icons of `key`, or
+        back in if they are the ones out. Out with the other ones, it only swaps them."""
+        before, self._tray_open = self._tray_open, None if self._tray_open == key else key
+        self._tray_marks()
+        out = (self._tray_job is None and self._tray.winfo_manager()
+               and int(self._tray.cget("height")) == self._tray_full)
+        if out:  # what leaves is whole on screen: pictured now, for when it comes back
+            self._tray_snap()
+        if self._tray_open and before and (out or self._swap_job):
+            # out with the other icons: these come in from the left of the bar
+            self._swap_t0 = time.perf_counter()
+            if self._swap_job is None:
+                self._swap_tray()
+            return
+        if self._swap_job is not None:  # put back in while they come: from their place
+            self.after_cancel(self._swap_job)
+            self._swap_job = None
+        # its icons stay while it slides back in
+        self._tray_put(self._tray_open or self._tray_shown, real=False)
+        # from wherever it is: a click while it slides turns it back from there
+        self._tray_from = int(self._tray.cget("height"))
+        self._tray_t0 = time.perf_counter()
+        if self._tray_job is None:
+            self._slide_tray()
+
+    def _tray_marks(self):
+        """The button of the icons out in the bar of the tools marked, the other one not."""
+        for key, btn in self._tray_btns.items():
+            btn.state(["selected" if key == self._tray_open else "!selected"])
+
+    def _tray_look(self, key: str):
+        """What the icons of `key` show now (grayed or not, the arrows of the history usable
+        or not): a picture of them taken while they looked otherwise is no longer them. None
+        while the mouse is over one, which changes it for a moment."""
+        look = []
+        for w in self._tray_sets[key].winfo_children():
+            if isinstance(w, ttk.Button):  # an arrow of the history
+                if w.instate(["active"]):
+                    return None
+                look.append(w.instate(["disabled"]))
+            for icon in w.winfo_children():  # the icon in its cell
+                bg = icon.cget("background")
+                if bg == theme.color("icon_hover"):
+                    return None
+                look.append((bg, str(icon.cget("highlightbackground")),
+                             str(icon.cget("cursor"))))
+        return look
+
+    def _tray_snap(self):
+        """A picture of the icons in the bar of the tools, which must be whole on screen, if
+        none shows them as they are now."""
+        key = self._tray_shown
+        if key is None:
+            return
+        look = self._tray_look(key)
+        if look is None or self._tray_pics.get(key, (None, None))[1] == look:
+            return
+        picture = snapshot(self._tray_sets[key])
+        if picture is not None:
+            self._tray_pics[key] = (picture, look)
+
+    def _tray_put(self, key: str | None, x: int = 0, real: bool = True):
+        """The icons of `key` in the bar of the tools, `x` pixels right of their place, and
+        no others. Tk paints every icon again at each step they move, which makes the slide
+        stutter: so while they move (not `real`) a picture of them stands in for them, if
+        there is one of them as they look now; the icons come back when they stop."""
+        pic, look = self._tray_pics.get(key, (None, None))
+        if real or look is None or look != self._tray_look(key):
+            pic = None
+        for k, tools in self._tray_sets.items():
+            if k == key and pic is None:
+                tools.place(relx=0.5, rely=1.0, x=x, y=-4 - SHADOW, anchor="s")
+            else:
+                tools.place_forget()
+        if pic is None:
+            self._tray_pic.place_forget()
+        else:
+            if self._tray_pic.cget("image") != str(pic):
+                self._tray_pic.configure(image=pic)
+            self._tray_pic.place(relx=0.5, rely=1.0, x=x, y=-4 - SHADOW, anchor="s")
+        self._tray_shown = key
+
+    def _swap_tray(self):
+        """One step of the icons of `_tray_open` coming into the bar of the tools, from just
+        off its left edge to their place, the other icons gone at once. As the slide: by the
+        time gone by, eased out."""
+        tray = self._tray
+        if not tray.winfo_exists():  # rebuilt meanwhile
+            self._swap_job = None
+            return
+        key = self._tray_open
+        done = min((time.perf_counter() - self._swap_t0) * 1000 / SWAP_MS, 1.0)
+        start = -(tray.winfo_width() + self._tray_sets[key].winfo_reqwidth()) / 2
+        self._tray_put(key, round(start * (1 - done) ** 3), real=done >= 1)
+        self._swap_job = self.after(5, self._swap_tray) if done < 1 else None
+
+    def _slide_tray(self):
+        """One step of the slide. Its height comes from the time gone by, not from the steps
+        made: a frame Tk is slow to paint does not hold the rest back. Eased out, so it starts
+        fast and settles. The board shrinks along, which only moves its plots (none is drawn
+        again)."""
+        tray = self._tray
+        if not tray.winfo_exists():  # rebuilt meanwhile
+            self._tray_job = None
+            return
+        target = self._tray_full if self._tray_open else 0
+        done = min((time.perf_counter() - self._tray_t0) * 1000 / TRAY_MS, 1.0)
+        h = round(self._tray_from + (target - self._tray_from) * (1 - (1 - done) ** 3))
+        if h != int(tray.cget("height")):  # the same height would lay the window out again
+            tray.configure(height=h)
+        if h and not tray.winfo_manager():
+            tray.pack(side="top", fill="x", after=self._bar)
+        elif not h:
+            tray.pack_forget()
+        if done < 1:
+            self._tray_job = self.after(5, self._slide_tray)
+        else:
+            self._tray_job = None
+            self._tray_put(self._tray_open)  # the icons themselves, or none when put away
 
     # ------------------------------------------------------------ updates
     def _check_update(self):
@@ -835,7 +1037,9 @@ class Program:
         plot selected, or one of an analysis that does not have that tool, it does nothing;
         except for the files, which are about every plot."""
         view = self._selected[0] if self._selected else None
-        if kind == "files":
+        if kind == "notes":
+            self.toggle_notes()
+        elif kind == "files":
             open_palette(self, kind)
         elif view is None or TOOL_VIEW.get(kind, view) != view:
             return
@@ -899,17 +1103,21 @@ class Program:
 
     def _fit_tools(self):
         """The tools follow the selected plot. The icon of a tool it does not have is grayed
-        (in place: no icon of the bar ever moves) and its menu entry is off; with no plot
+        (in place: no icon of the bar ever moves); with no plot
         selected, all of them. And every floating window (tools, calculations, pictures)
         belongs to the analysis where it was opened: it is put away while the selected plot is
         of the other one and comes back with a plot of its own. The files are the exception
-        to both: they list the plots of every analysis, so they are always there."""
+        to both: they list the plots of every analysis, so they are always there. So are the
+        notes, which are about the board; their icon is marked while they are on."""
         view = self._selected[0] if self._selected else None
         for kind, icon in self._tool_icons.items():
-            on = kind == "files" or (view is not None and TOOL_VIEW.get(kind, view) == view)
+            on = kind in ("files", "notes") or (view is not None
+                                                and TOOL_VIEW.get(kind, view) == view)
+            edge = ("chart_edge_on" if kind == "notes" and self._notes_on else
+                    "icon_edge" if on else "icon_edge_off")
             draw_tool_icon(icon, kind, TOOL_SIZE)
-            icon.configure(cursor="hand2" if on else "", highlightbackground=theme.color(
-                "icon_edge" if on else "icon_edge_off"))
+            icon.configure(cursor="hand2" if on else "", highlightbackground=theme.color(edge),
+                **({} if on else {"background": theme.color("paper")}))  # grayed under the mouse
             for item in () if on else icon.find_all():
                 for opt in ("fill", "outline"):
                     try:
@@ -917,10 +1125,6 @@ class Program:
                             icon.itemconfigure(item, **{opt: theme.color("icon_off")})
                     except tk.TclError:  # lines have no outline
                         pass
-        # the menu: the three tools every plot has, then the tools of each analysis
-        for i, own in enumerate((view, "files", view, "tga", "rheology")):
-            on = own == "files" or (view is not None and own == view)
-            self._tools_menu.entryconfigure(i, state="normal" if on else "disabled")
         # while the interface is rebuilt every file goes through the controls: the windows
         # would come and go with each one. They are fitted once, at the end
         for win in () if self._rebuilding else self.winfo_children():
@@ -940,25 +1144,30 @@ class Program:
     # -------------------------------------------------------------- board
     def _new_sheet(self, n: int, name: str | None = None, zoom: float = 1.0,
                    origin: tuple[float, float] = (0.0, 0.0)) -> dict:
-        """Sheet number `n`: its board, with the hint an empty one shows, and its tab, which
+        """Sheet number `n`: its board and its tab, which
         shows `name` (None: "Sheet" and its number). A double click on the tab renames the
         sheet; a right click renames or closes it. `zoom`: how large its plots are shown;
         `origin`: where, on the board, the zoom has left the corner they are placed from."""
-        board = tk.Frame(self, background=theme.color("board"))
+        cursor = "xterm" if self._notes_on else ""
+        board = tk.Frame(self, background=theme.color("board"), cursor=cursor)
         board.bind("<Configure>", self._board_resized)
-        hint = tk.Label(board, text=tr("board_hint"), background=theme.color("board"),
-                        foreground=theme.color("hint"), font=("Segoe UI", 11),
-                        justify="center")
-        hint.place(relx=0.5, rely=0.45, anchor="center")
+        # the grid, behind everything on the board: a Frame draws no lines
+        grid = tk.Canvas(board, background=theme.color("board"), highlightthickness=0,
+                         cursor=cursor)
+        grid.place(x=0, y=0, relwidth=1, relheight=1)
         tab = tk.Label(self._tabs, text=name or f"Sheet{n}", padx=10, pady=2)
         # as tall as the strip, which "+" makes taller than a tab: the open one meets its board
         tab.pack(side="left", fill="y", padx=(0, 1), before=self._add_tab)
         # "selected": the plot selected on it, which is selected again when the sheet is opened
-        sheet = {"n": n, "name": name, "zoom": zoom, "origin": origin, "board": board, "hint": hint, "tab": tab,
-                 "selected": None}
+        sheet = {"n": n, "name": name, "zoom": zoom, "origin": origin, "board": board, "tab": tab,
+                 "grid": grid, "selected": None}
+        grid.bind("<Configure>", lambda _e: self._draw_grid(sheet))
         tab.bind("<Button-1>", lambda _e: self.show_sheet(self._sheets.index(sheet)))
         tab.bind("<Double-Button-1>", lambda _e: self.rename_sheet(sheet))
         tab.bind("<Button-3>", lambda e: self._sheet_menu(sheet, e))
+        for w in (board, grid):
+            w.bind("<Button-1>", lambda e: self._board_click(sheet, e))
+        hover(tab)
         self._sheets.append(sheet)
         return sheet
 
@@ -1063,6 +1272,72 @@ class Program:
         for chart in self._charts.values():
             if chart.master is sheet["board"]:
                 chart.set_scale(zoom, sheet["origin"])
+        for note in self._notes(sheet):
+            note.set_scale(zoom, sheet["origin"])
+        self._draw_grid(sheet)
+
+    # -------------------------------------------------------------- grid
+    def open_grid(self):
+        """"View > Background format": the window of the board's grid, or the one already
+        open brought to the front; the first time, at the top right corner of the board."""
+        for w in self.winfo_children():
+            if isinstance(w, GridWindow):
+                w.deiconify()
+                w.lift()
+                return
+        win = GridWindow(self)
+        self.update_idletasks()
+        board = self.board
+        w, h = win.body.winfo_reqwidth() + 2 * win.RIM + 2, win.fit_height()
+        x = board.winfo_rootx() + max(board.winfo_width() - w - 16, 0)
+        win.geometry(f"{w}x{h}+{x}+{board.winfo_rooty() + 16}")
+
+    def grid_color(self) -> str:
+        """Color of the lines of the grid: the one chosen, or the theme's."""
+        return self._grid_color or theme.color("grid")
+
+    def set_grid(self, name: str):
+        """The grid of every board: one of `GRIDS` ("none": a blank board)."""
+        self._grid = name
+        i18n.save_setting("grid", name)
+        for sheet in self._sheets:
+            self._draw_grid(sheet)
+
+    def set_grid_rule(self, on: bool):
+        """Rule lines: the grid of every board drawn with its horizontal lines alone."""
+        self._grid_rule = on
+        i18n.save_setting("grid_rule", "1" if on else "")
+        for sheet in self._sheets:
+            self._draw_grid(sheet)
+
+    def set_grid_color(self, color: str | None):
+        """Color of the lines of the grid, "#rrggbb" (None: the theme's again)."""
+        self._grid_color = color
+        i18n.save_setting("grid_color", color or "")
+        for sheet in self._sheets:
+            self._draw_grid(sheet)
+
+    def _draw_grid(self, sheet: dict):
+        """The grid of a sheet: zoomed and placed from the origin like its plots, so it moves
+        with them. Lines that would come closer than a few pixels are drawn every other one."""
+        c = sheet["grid"]
+        c.delete("all")
+        step = GRIDS[self._grid] * sheet["zoom"]
+        if not step:
+            return
+        while step < 6:
+            step *= 2
+        w, h = c.winfo_width(), c.winfo_height()
+        ox, oy = sheet["origin"]
+        color = self.grid_color()
+        if not self._grid_rule:
+            for x in np.arange(ox % step, w, step):
+                c.create_line(round(x), 0, round(x), h, fill=color)
+        for y in np.arange(oy % step, h, step):
+            c.create_line(0, round(y), w, round(y), fill=color)
+        # a thin strip of the board's own color under the bar on top: a line that falls at
+        # the very top would look like an edge of the bar
+        c.create_rectangle(0, 0, w, GRID_TOP, fill=theme.color("board"), width=0)
 
     def _board_wheel(self, event):
         """Ctrl + mouse wheel over the blank of the board: zoom of the sheet, in and out,
@@ -1081,6 +1356,69 @@ class Program:
                 self._zoom.step(1 if event.delta > 0 else -1)
             finally:
                 self._zoom_at = (0, 0)
+
+    # -------------------------------------------------------------- notes
+    def toggle_notes(self, on: bool | None = None):
+        """The "Notes" tool, on or off (None: the other way): while on, a click on the blank
+        of the board starts a note there, and the board shows the cursor of text."""
+        on = not self._notes_on if on is None else on
+        if on == self._notes_on:
+            return
+        self._notes_on = on
+        for sheet in self._sheets:
+            for w in (sheet["board"], sheet["grid"]):
+                w.configure(cursor="xterm" if on else "")
+        self._fit_tools()
+
+    @staticmethod
+    def _notes(sheet: dict) -> list[Note]:
+        """The notes of a sheet, from the one at the bottom to the one on top."""
+        return [w for w in sheet["board"].winfo_children() if isinstance(w, Note)]
+
+    def _notes_state(self) -> list[list[tuple]]:
+        """The notes of each sheet, as data: (x, y, text). One still empty is not one yet."""
+        return [[(*note.at, note.content()) for note in self._notes(sheet)
+                 if note.content().strip()] for sheet in self._sheets]
+
+    def _add_note(self, sheet: dict, x: float, y: float, text: str = "") -> Note:
+        """A note on the board of `sheet`, at (x, y) at 100% zoom; above its plots."""
+        return Note(sheet["board"], x, y, text, sheet["zoom"], sheet["origin"],
+                    remove_label=tr("note_remove"))
+
+    def _lift_notes(self, sheet: dict):
+        """The notes stay above the plots: they are written over them."""
+        for note in self._notes(sheet):
+            note.lift()
+
+    def _typed_note(self) -> Note | None:
+        """The note being typed in, if any."""
+        try:
+            w = self.focus_get()
+        except (KeyError, tk.TclError):  # open list of a Combobox (internal Tk window)
+            return None
+        return w.master if w is not None and isinstance(w.master, Note) else None
+
+    def _board_click(self, sheet: dict, event):
+        """A click on the blank of a board ends the typing of a note; if none was being
+        typed and "Notes" is on, a new note starts where it was."""
+        if self._typed_note() is not None:
+            self.focus_set()
+        elif self._notes_on:
+            board = sheet["board"]
+            x, y = event.x_root - board.winfo_rootx(), event.y_root - board.winfo_rooty()
+            (ox, oy), zoom = sheet["origin"], sheet["zoom"]
+            # the click is where the text starts, not the corner of its outline
+            pad = (Note.RIM + 1) * zoom
+            note = self._add_note(sheet, (x - ox - pad) / zoom, (y - oy - pad) / zoom)
+            note.text.focus_set()
+        return "break"
+
+    def _click_away(self, event):
+        # a click in a floating window moves the focus there by itself, if it takes it
+        note, w = self._typed_note(), event.widget
+        if (note is not None and isinstance(w, tk.Misc) and w.winfo_toplevel() is self
+                and note not in (w, w.master)):
+            self.focus_set()
 
     def _sheet_of(self, chart: ChartWindow) -> dict:
         return next(sheet for sheet in self._sheets if sheet["board"] is chart.master)
@@ -1105,7 +1443,7 @@ class Program:
             box = (24 + step - ox, 16 + step - oy, side, side)
         self._charts[(view, key)] = chart
         chart.put(*box)
-        sheet["hint"].place_forget()
+        self._lift_notes(sheet)
         return chart
 
     def _open_sheet(self) -> dict:
@@ -1130,6 +1468,7 @@ class Program:
         chart = self._charts[(view, key)] = self._charts.pop((view, key))  # now the top one
         chart.lift()
         sheet = self._sheet_of(chart)
+        self._lift_notes(sheet)
         sheet["selected"] = (view, key)
         if sheet["board"] is not self.board:
             self.show_sheet(self._sheets.index(sheet))  # which selects it
@@ -1170,8 +1509,6 @@ class Program:
                     self.select_chart(*left[-1])
                 else:
                     self._select_none()
-        if not left:
-            sheet["hint"].place(relx=0.5, rely=0.45, anchor="center")
 
     def _board_resized(self, event):
         for chart in self._charts.values():  # a smaller board: no plot is left out of reach
@@ -1334,6 +1671,7 @@ class Program:
             "sheet_sel": [sheet["selected"] for sheet in self._sheets],
             "charts": {k: (self._sheets.index(self._sheet_of(c)), c.box)
                        for k, c in self._charts.items()},
+            "notes": self._notes_state(),
         }
 
     def _restore(self, st: dict):
@@ -1427,6 +1765,7 @@ class Program:
                        for sheet in self._sheets],
             "charts": {k: (self._sheets.index(self._sheet_of(c)), c.box)
                        for k, c in self._charts.items()},
+            "notes": self._notes_state(),
         }
 
     @staticmethod
@@ -1443,7 +1782,7 @@ class Program:
         return ([(k, id(df)) for k, df in st["files"].items()],
                 {k: Program._file_choices(s) for k, s in st["states"].items()},
                 [(k, id(df)) for k, df in st["rheo_files"].items()], st["rheo"],
-                [sheet[:2] for sheet in st["sheets"]], st["charts"])
+                [sheet[:2] for sheet in st["sheets"]], st["charts"], st["notes"])
 
     def _history_tick(self):
         """Looks for a change, as the floating tools do: nothing in the program has to tell
@@ -1529,6 +1868,12 @@ class Program:
             if box != now["charts"][name][1]:
                 self._charts[name].put(*box)
                 last = name
+        for sheet, notes, old in zip(self._sheets, st["notes"], now["notes"]):
+            if notes != old:
+                for note in self._notes(sheet):
+                    note.destroy()
+                for x, y, text in notes:
+                    self._add_note(sheet, x, y, text)
         if last:
             self._selected = None  # selected from scratch: its file may have left the controls
             self.select_chart(*last)
@@ -1553,7 +1898,7 @@ class Program:
         rheo = st["rheo"]
         snap.update(
             cur=self._cur_key if self._cur_key in self.files else None,
-            sheets=list(sheets), sheet_sel=selected, charts=dict(charts),
+            sheets=list(sheets), sheet_sel=selected, charts=dict(charts), notes=st["notes"],
             sheet=charts[back[-1]][0] if back else numbers.index(n) if n in numbers else 0,
             rheo={"files": dict(st["rheo_files"]), "cur": self.rheo._cur_key,
                   "cols": {k: v[0] for k, v in rheo.items()},
@@ -2731,7 +3076,13 @@ class App(Program, tk.Tk):
         theme.apply(self)
         self.title("Baseline Lab")
         self.minsize(*self.MIN_SIZE)
-        self._place_reduced()
+        self._place_reduced()  # where it goes back to when it is restored
+        try:
+            self.state("zoomed")  # opens maximized
+        except tk.TclError:  # only Windows and macOS have it
+            pass
+        self._at = None  # where the window is, to move the floating windows along with it
+        self.bind("<Configure>", self._follow, add="+")
         self._init_state()
         title_bar(self)
         self._check_update()
@@ -2754,6 +3105,22 @@ class App(Program, tk.Tk):
         # a little above the middle: the taskbar takes the bottom of the screen
         x, y = (screen[0] - w) // 2, max(0, (screen[1] - h) // 2 - 20)
         self.geometry(f"{w}x{h}+{x}+{y}")
+
+    def _follow(self, event):
+        """The floating windows are part of the window: when it moves (dragged, maximized or
+        restored) they move by as much, hidden ones too, so they come back in their place."""
+        if event.widget is not self or self.state() == "iconic":  # iconic: parked off screen
+            return
+        at = self.winfo_rootx(), self.winfo_rooty()
+        if self._at is not None and at != self._at:
+            dx, dy = at[0] - self._at[0], at[1] - self._at[1]
+            stack = list(self.winfo_children())
+            while stack:  # a tool window may belong to another one (a calculation's)
+                w = stack.pop()
+                if isinstance(w, ToolWindow):
+                    w.shift(dx, dy)
+                stack.extend(w.winfo_children())
+        self._at = at
 
 
 def main(argv: list[str] | None = None):

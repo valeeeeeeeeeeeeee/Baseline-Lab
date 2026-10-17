@@ -10,6 +10,7 @@ import sys
 import tkinter as tk
 import weakref
 from pathlib import Path
+from tkinter import font as tkfont
 from tkinter import ttk
 
 import numpy as np
@@ -241,6 +242,13 @@ def title_bar(window):
         # DWMWA_USE_IMMERSIVE_DARK_MODE
         handle = _wrapper(window)
         dwm(handle, 20, ctypes.byref(dark), ctypes.sizeof(dark))
+        # DWMWA_CAPTION_COLOR, DWMWA_TEXT_COLOR: the gray of the top bar, which is the ttk
+        # background. Only Windows 11 takes them; Windows 10 refuses them and keeps its own
+        for attribute, name in ((35, ttk.Style(window).lookup(".", "background")),
+                                (36, theme.color("ink"))):
+            r, g, b = (v >> 8 for v in window.winfo_rgb(name))
+            ref = ctypes.c_uint(r | g << 8 | b << 16)  # COLORREF: 0x00bbggrr
+            dwm(handle, attribute, ctypes.byref(ref), ctypes.sizeof(ref))
         # Windows 10 only draws the bar again when the window gains or loses the keyboard:
         # WM_NCACTIVATE tells it so, first the opposite of what it is, then what it is
         user32 = ctypes.windll.user32
@@ -274,10 +282,11 @@ class _BitmapInfo(ctypes.Structure):
                 ("compression", ctypes.c_uint32), ("rest", ctypes.c_uint32 * 8)]
 
 
-def _picture(window) -> tk.PhotoImage | None:
+def _picture(window, part=None) -> tk.PhotoImage | None:
     """Windows: what the top-level `window` shows now, under the system's title bar if it has
-    one; None if it is not on screen. Asked from the window itself, not copied from the
-    screen: whatever covers it is not in the picture."""
+    one, or only its `part` (x, y, width, height, from its corner); None if it is not on
+    screen. Asked from the window itself, not copied from the screen: whatever covers it is
+    not in the picture."""
     user32, gdi32 = ctypes.WinDLL("user32"), ctypes.WinDLL("gdi32")
     void, num = ctypes.c_void_p, ctypes.c_int
     for lib, name, args in ((user32, "GetDC", [void]), (gdi32, "CreateCompatibleDC", [void]),
@@ -319,9 +328,26 @@ def _picture(window) -> tk.PhotoImage | None:
     if rows != h:
         return None
     rgb = np.frombuffer(pixels, np.uint8, w * h * 4).reshape(h, w, 4)[:, :, 2::-1]  # from BGRA
-    rgb = rgb[top:top + window.winfo_height(), left:left + window.winfo_width()]
+    x, y, w, h = part or (0, 0, window.winfo_width(), window.winfo_height())
+    rgb = rgb[top + y:top + y + h, left + x:left + x + w]
     h, w = rgb.shape[:2]
+    if not (h and w):
+        return None
     return tk.PhotoImage(master=window, data=b"P6 %d %d 255\n" % (w, h) + rgb.tobytes())
+
+
+def snapshot(widget) -> tk.PhotoImage | None:
+    """Windows: a picture of what `widget` shows now, taken from its top-level window (so
+    nothing that covers it is in it); None elsewhere, or if it is not on screen."""
+    if sys.platform != "win32" or not widget.winfo_ismapped():
+        return None
+    top = widget.winfo_toplevel()
+    try:
+        return _picture(top, (widget.winfo_rootx() - top.winfo_rootx(),
+                              widget.winfo_rooty() - top.winfo_rooty(),
+                              widget.winfo_width(), widget.winfo_height()))
+    except (AttributeError, OSError, tk.TclError):
+        return None
 
 
 def _stacked(windows) -> list:
@@ -550,6 +576,13 @@ class ToolWindow(tk.Toplevel):
         else:
             self._fit_body()
             self.geometry(f"{self.winfo_width()}x{self._full_height}")
+
+    def shift(self, dx: int, dy: int):
+        """Moves it by (dx, dy), keeping its size: it follows its owner when that one moves.
+        The geometry is read from the window manager, which a hidden window also has."""
+        # Tk writes a position left of the screen as "+-5"
+        size, x, y = re.fullmatch(r"(\d+x\d+)\+?(-?\d+)\+?(-?\d+)", self.geometry()).groups()
+        self.geometry(f"{size}+{int(x) + dx}+{int(y) + dy}")
 
     def full_geometry(self) -> str:
         """Its geometry when open (a minimized window is only as tall as its header)."""
@@ -786,6 +819,131 @@ class ChartWindow(tk.Frame):
             self._edge_cursor(event)
         else:  # the drag ended off the edge, which was left with no `<Leave>` to say so
             self._edge_left()
+
+
+class Note(tk.Frame):
+    """A block of text typed on the board ("Notes" tool). A gray outline goes around it
+    while it is being typed or the mouse is over it, and the note is dragged over the board
+    by the margin inside that outline; otherwise only the text shows. It is as large as its
+    text. Its place is kept at 100% zoom, like a plot's (`ChartWindow.box`), and its letters
+    grow with the zoom. A note left empty goes away when the typing ends."""
+
+    RIM = 5    # margin between the text and the outline: what is dragged
+    FONT = 13  # height of the letters at 100%, in pixels
+
+    def __init__(self, board, x: float, y: float, text: str = "", scale: float = 1.0,
+                 origin: tuple[float, float] = (0.0, 0.0), remove_label: str = ""):
+        paper = theme.color("board")
+        super().__init__(board, background=paper, highlightthickness=1, cursor="fleur",
+                         highlightbackground=paper, highlightcolor=paper)
+        self.at = (x, y)  # where it is on the board, at 100% zoom
+        self.scale, self.origin = scale, origin
+        self._font = tkfont.Font(family="Segoe UI", size=-max(round(self.FONT * scale), 1))
+        self._drag = None  # where a drag started: the pointer and the note, on screen
+        self.text = tk.Text(self, font=self._font, borderwidth=0, highlightthickness=0,
+                            wrap="none", undo=True, padx=1, pady=0, cursor="xterm",
+                            background=paper, foreground=theme.color("ink"),
+                            insertbackground=theme.color("ink"))
+        self.text.insert("1.0", text)
+        self.text.edit_reset()  # what came with it is not something to undo
+        self.text.edit_modified(False)
+        self.text.place(x=self.RIM, y=self.RIM)
+        self.text.bind("<<Modified>>", self._modified)
+        self.text.bind("<FocusIn>", lambda _e: self._outline())
+        self.text.bind("<FocusOut>", self._focus_out)
+        self.text.bind("<Escape>", lambda _e: (self.winfo_toplevel().focus_set(), "break")[1])
+        for w in (self, self.text):
+            w.bind("<Enter>", lambda _e: self._outline(), add="+")
+            w.bind("<Leave>", lambda _e: self.after_idle(self._outline), add="+")
+            w.bind("<Button-3>", self._menu)
+        self.bind("<Button-1>", self._drag_start)
+        self.bind("<B1-Motion>", self._drag_move)
+        self.bind("<ButtonRelease-1>", lambda _e: setattr(self, "_drag", None))
+        self._remove_label = remove_label
+        self._fit()
+
+    def content(self) -> str:
+        return self.text.get("1.0", "end-1c")
+
+    def editing(self) -> bool:
+        try:
+            return self.focus_get() is self.text
+        except (KeyError, tk.TclError):  # open list of a Combobox (internal Tk window)
+            return False
+
+    def _outline(self):
+        """The outline shows while the note is typed in or the mouse is over it."""
+        if not self.winfo_exists():
+            return
+        try:
+            under = self.winfo_containing(*self.winfo_pointerxy())
+        except (KeyError, tk.TclError):
+            under = None
+        on = self.editing() or under in (self, self.text) or self._drag is not None
+        edge = theme.color("note_edge" if on else "board")
+        self.configure(highlightbackground=edge, highlightcolor=edge)
+
+    def _focus_out(self, _event):
+        # with the app left for another (no focus anywhere in it) the typing goes on when
+        # it comes back: only a focus taken inside the app ends it
+        def done():
+            if not self.winfo_exists():
+                return
+            try:
+                elsewhere = self.focus_get() is not None
+            except (KeyError, tk.TclError):
+                elsewhere = True
+            if elsewhere and not self.content().strip():
+                self.destroy()
+            else:
+                self._outline()
+        self.after_idle(done)  # not from inside a binding of its own text
+
+    def _modified(self, _event):
+        self.text.edit_modified(False)  # or <<Modified>> comes no more
+        self._fit()
+
+    def _fit(self):
+        """As large as its text (and a little room for the insertion cursor), where `at`
+        says at the zoom of the board."""
+        lines = self.content().split("\n")
+        w = max([self._font.measure(line) for line in lines] + [self._font.measure("  ")]) + 6
+        h = len(lines) * self._font.metrics("linespace")
+        self.text.place_configure(width=w, height=h)
+        self.place(x=round(self.at[0] * self.scale + self.origin[0]),
+                   y=round(self.at[1] * self.scale + self.origin[1]),
+                   width=w + 2 * (self.RIM + 1), height=h + 2 * (self.RIM + 1))
+        # a Text larger than what it shows scrolls when it is typed in: back to the start
+        self.text.xview_moveto(0)
+        self.text.yview_moveto(0)
+
+    def set_scale(self, scale: float, origin: tuple[float, float]):
+        """The zoom of the board changed: the note takes it, letters and all."""
+        self.scale, self.origin = scale, origin
+        self._font.configure(size=-max(round(self.FONT * scale), 1))
+        self._fit()
+
+    def _drag_start(self, _event):
+        self._drag = (*self.winfo_pointerxy(), self.winfo_x(), self.winfo_y())
+
+    def _drag_move(self, _event):
+        if self._drag is None:
+            return
+        x0, y0, nx, ny = self._drag
+        px, py = self.winfo_pointerxy()
+        x, y = nx + px - x0, ny + py - y0
+        self.at = ((x - self.origin[0]) / self.scale, (y - self.origin[1]) / self.scale)
+        self.place_configure(x=x, y=y)
+        self.update_idletasks()
+
+    def _menu(self, event):
+        menu = tk.Menu(self, tearoff=0)
+        menu.add_command(label=self._remove_label, command=lambda: self.after_idle(self.destroy))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+        return "break"
 
 
 class ZoomSlider(tk.Canvas):

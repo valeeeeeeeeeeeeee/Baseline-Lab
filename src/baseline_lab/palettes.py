@@ -30,6 +30,8 @@ MODEL_COLUMNS = (("model", "rheo_col_model", 150, "w"), ("eq", "rheo_col_eq", 12
                  ("params", "rheo_col_params", 200, "w"), ("r2", "R²", 60, "e"),
                  ("rmse", "RMSE", 60, "e"), ("aicc", "AICc", 60, "e"))
 POLL_MS = 250
+# the grids of the board ("Background format"): {name: the space between two lines at 100%}
+GRIDS = {"none": 0, "small": 10, "medium": 20, "large": 40, "xlarge": 80}
 
 
 def popup(menu: tk.Menu, event):
@@ -408,10 +410,10 @@ class ColorWindow(ToolWindow):
     BAR = 16           # thickness of the bars of value and alpha
     CELL, GAP = 16, 2  # side of a ready-made color and the space between two
 
-    def __init__(self, owner, color: str | None, on_pick):
+    def __init__(self, owner, color: str | None, on_pick, title: str | None = None):
         super().__init__(owner)
         self._on_pick = on_pick
-        self.title(tr("paint_title"))
+        self.title(title or tr("paint_title"))
         self.h, self.s, self.v, self.a = hex_hsva(color) if color else (0.0, 1.0, 1.0, 255)
         self._imgs = {}        # the pictures on screen: Tk does not hold them
         self._syncing = False  # the fields are being written by the program, not typed in
@@ -594,6 +596,88 @@ class ColorWindow(ToolWindow):
     def _take(self, color: str | None):
         self.destroy()
         self._on_pick(color)
+
+
+class GridWindow(ToolWindow):
+    """"Background format" ("View" menu): the grid drawn on the board, behind the plots. Each
+    size is a small square that shows it, with its name under it; a click on either takes it.
+    At the bottom, the color of the lines, taken with the color picker. The choice is the main
+    window's (`set_grid`, `set_grid_color`): this one only shows it."""
+
+    CELL = 46     # side of the square of a size
+    SHRINK = 2.5  # ... which shows its lines that many times closer than on the board
+
+    def __init__(self, app):
+        super().__init__(app)
+        self.app = app
+        self.title(tr("grid_title"))
+        # rule lines: the horizontal lines alone, as on ruled paper
+        self._rule = tk.BooleanVar(value=app._grid_rule)
+        ttk.Checkbutton(self.body, text=tr("grid_rule"), variable=self._rule, takefocus=False,
+                        command=self._take_rule).pack(anchor="w", padx=8, pady=(8, 0))
+        row = ttk.Frame(self.body)
+        row.pack(padx=8, pady=(6, 4))
+        self._cells = {}
+        for name in GRIDS:
+            box = ttk.Frame(row)
+            box.pack(side="left", padx=3)
+            cell = tk.Canvas(box, width=self.CELL, height=self.CELL, highlightthickness=2,
+                             cursor="hand2")
+            cell.pack()
+            label = ttk.Label(box, text=tr(f"grid_{name}"), font=("Segoe UI", 8),
+                              cursor="hand2")
+            label.pack(pady=(2, 0))
+            for w in (cell, label):
+                w.bind("<Button-1>", lambda _e, n=name: self._take(n))
+            self._cells[name] = cell
+        ttk.Separator(self.body).pack(fill="x", padx=8, pady=6)
+        line = ttk.Frame(self.body)
+        line.pack(fill="x", padx=8, pady=(0, 8))
+        self._swatch = tk.Canvas(line, width=18, height=18, highlightthickness=1)
+        self._swatch.pack(side="left", padx=(0, 6))
+        self._swatch.bind("<Button-1>", lambda _e: self._pick())
+        ttk.Button(line, text=tr("grid_color"), style="Small.TButton", takefocus=False,
+                   command=self._pick).pack(side="left")
+        self.bind("<Escape>", lambda _e: self.destroy())
+        self.show()
+
+    def show(self):
+        """Every square drawn with the color of the lines as it is now, the chosen one marked."""
+        app, size = self.app, self.CELL
+        color, paper = app.grid_color(), theme.color("board")
+        for name, cell in self._cells.items():
+            on = name == app._grid
+            cell.configure(background=paper, highlightthickness=2,
+                           highlightbackground=theme.color("chart_edge_on" if on else "outline"),
+                           highlightcolor=theme.color("chart_edge_on" if on else "outline"))
+            cell.delete("all")
+            step = GRIDS[name] / self.SHRINK
+            if not step:
+                continue
+            start = (size % step) / 2  # centered: the same margin on both sides
+            for v in np.arange(start, size, step):
+                v = round(v)
+                if not app._grid_rule:
+                    cell.create_line(v, 0, v, size, fill=color)
+                cell.create_line(0, v, size, v, fill=color)
+        self._swatch.configure(background=color, highlightbackground=theme.color("outline"))
+
+    def _take(self, name: str):
+        self.app.set_grid(name)
+        self.show()
+
+    def _take_rule(self):
+        self.app.set_grid_rule(self._rule.get())
+        self.show()
+
+    def _pick(self):
+        def picked(color):
+            # the board is a Tk widget: it has no alpha
+            self.app.set_grid_color(color[:7] if color else None)
+            if self.winfo_exists():
+                self.show()
+
+        ColorWindow(self.app, self.app._grid_color, picked, title=tr("grid_color_title"))
 
 
 def palette_view(app) -> str:
